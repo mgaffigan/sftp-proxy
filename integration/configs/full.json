@@ -1,0 +1,8 @@
+{
+  "hostKeyFile": "/run/host_key",
+  "port": 2222,
+  "uploadStagingDir": "/staging",
+  "authBackend": {
+    "url": "http://backend-full:8080/auth"
+  }
+}

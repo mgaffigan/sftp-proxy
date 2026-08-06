@@ -1,0 +1,1 @@
+docker compose -f integration/compose.yml --profile full up --build backend-full proxy-full

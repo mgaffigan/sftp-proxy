@@ -1,0 +1,71 @@
+services:
+  backend-trivial:
+    build:
+      context: .
+      dockerfile: backend/trivial.Dockerfile
+    profiles: [trivial]
+    volumes:
+      - ./backend/trivial.js:/app/server.js:ro
+    command: ["node", "/app/server.js"]
+
+  proxy-trivial:
+    build:
+      context: ..
+    profiles: [trivial]
+    depends_on:
+      - backend-trivial
+    volumes:
+      - ./configs/trivial.json:/config/config.json:ro
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["ssh-keygen -q -t ed25519 -N '' -f /run/host_key && exec /usr/local/bin/sftp-proxy -config /config/config.json"]
+
+  clients-trivial:
+    build:
+      context: .
+      dockerfile: clients.Dockerfile
+    profiles: [trivial]
+    depends_on:
+      - proxy-trivial
+    volumes:
+      - ./clients:/tests:ro
+      - ./fixtures:/fixtures:ro
+    command: ["/bin/sh", "/tests/trivial.sh"]
+
+  backend-full:
+    image: node:22-alpine
+    profiles: [full]
+    volumes:
+      - ./backend/full.js:/app/server.js:ro
+    command: ["node", "/app/server.js"]
+
+  proxy-full:
+    build:
+      context: ..
+    profiles: [full]
+    depends_on:
+      - backend-full
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./configs/full.json:/config/config.json:ro
+      - full-hostkey:/run
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["ssh-keygen -q -t ed25519 -N '' -f /run/host_key && exec /usr/local/bin/sftp-proxy -config /config/config.json"]
+
+  clients-full:
+    build:
+      context: .
+      dockerfile: clients.Dockerfile
+    profiles: [full]
+    depends_on:
+      - proxy-full
+    volumes:
+      - ./clients:/tests:ro
+      - ./fixtures:/fixtures:ro
+      - full-hostkey:/hostkey:ro
+    command: ["/bin/sh", "-ec", "python /tests/full.py && /tests/full-openssh.sh && /tests/full-lftp.sh && /tests/full-psftp.sh"]
+
+volumes:
+  full-hostkey:

@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SFTP Proxy configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["hostKeyFile"],
+  "anyOf": [
+    { "required": ["users"] },
+    { "required": ["authBackend"] }
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri-reference",
+      "description": "Location of this schema for editor support."
+    },
+    "hostKeyFile": {
+      "type": "string",
+      "minLength": 1,
+      "description": "PEM SSH host key used by the server."
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 2222
+    },
+    "uploadStagingDir": {
+      "type": "string",
+      "minLength": 1,
+      "default": "staging",
+      "description": "Private directory used while SFTP uploads are in progress."
+    },
+    "authBackend": { "$ref": "#/$defs/authBackend" },
+    "users": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/user" }
+    }
+  },
+  "$defs": {
+    "authBackend": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["baseURL"] },
+        { "required": ["url"] }
+      ],
+      "properties": {
+        "baseURL": {
+          "type": "string",
+          "format": "uri",
+          "description": "Base URL for the multi-step authentication API."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Single endpoint for password authentication and filesystem setup."
+        }
+      }
+    },
+    "user": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["username", "rootfs"],
+      "anyOf": [
+        { "required": ["passwordHash"] },
+        { "required": ["authorizedKeys"] }
+      ],
+      "properties": {
+        "username": { "$ref": "#/$defs/name" },
+        "passwordHash": {
+          "type": "string",
+          "minLength": 1,
+          "description": "bcrypt password hash."
+        },
+        "authorizedKeys": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "rootfs": { "$ref": "#/$defs/rootfs" }
+      }
+    },
+    "rootfs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["children"],
+      "properties": {
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/entry" }
+        }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            { "required": ["directory"], "not": { "required": ["file"] } },
+            { "required": ["file"], "not": { "required": ["directory"] } }
+          ]
+        },
+        {
+          "if": { "required": ["file"] },
+          "then": {
+            "required": ["backend"],
+            "properties": { "children": { "maxItems": 0 } },
+            "not": { "required": ["allowed_methods"] }
+          }
+        },
+        {
+          "if": { "required": ["directory"] },
+          "then": {
+            "anyOf": [
+              { "required": ["backend"] },
+              { "properties": { "children": { "minItems": 1 } }, "required": ["children"] }
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "directory": { "$ref": "#/$defs/name" },
+        "file": { "$ref": "#/$defs/name" },
+        "backend": { "type": "string", "format": "uri" },
+        "allowed_methods": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["GET", "POST", "DELETE"] },
+          "description": "HTTP methods the proxy may send to this directory. An omitted value allows all supported methods."
+        },
+        "size": { "type": "integer", "minimum": 0 },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/entry" }
+        },
+        "maxUploadSize": { "type": "integer", "minimum": 0 },
+        "maxConcurrentUploads": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!\\.{1,2}$)[^/\\\\\\u0000]+$"
+    }
+  }
+}

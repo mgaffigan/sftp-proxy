@@ -1,0 +1,216 @@
+We're going to create a bulletproof SFTP to HTTP proxy that can serve as a front-end for a B2B interface.  We want to use the most widely deployed and tested SFTP/SCP library that we can, while avoiding unneccessary complexity (wireguard-style auditable code is best, but new entrants that are not established are not ok).  Go, C#, rust, java, and other languages if approved are fine .  C/C++ should be avoided.
+
+## V1 Implementation Contract
+
+The first implementation is Go, using `golang.org/x/crypto/ssh` for SSH and
+`github.com/pkg/sftp` for SFTP. It supports SFTP; SCP is a required
+compatibility target, but is deferred until the SFTP implementation is proven.
+The initial virtual filesystem backend is HTTP. Local storage and S3-compatible
+backends are deferred.
+
+The server uses a configured PEM host key and refuses to start if it cannot
+load it. By default it listens on TCP port 2222 on IPv4 and IPv6 wildcard
+addresses. It must fail startup rather than silently losing an address family.
+
+### Configuration and Authentication
+
+A static user is found by its SSH username and authenticates with a configured
+password hash and/or configured authorized public keys. A static user does not
+call the HTTP authentication backend.
+
+Dynamic authentication is username-first, so a backend need only return the
+policy for the requested user rather than every possible public key. The
+dynamic flow has three phases:
+
+1. `POST /v1/sftp/auth/lookup` receives the username and client connection
+  metadata. It returns allowed authentication methods and, for public-key
+  authentication, the public keys authorized for that username.
+2. For password authentication, `POST /v1/sftp/auth/password` receives the
+  username, password, and connection metadata. For public-key authentication,
+  the proxy verifies the SSH signature locally using a key returned by lookup.
+3. `POST /v1/sftp/auth/finalize` receives the username, authenticated method,
+  and connection metadata. It returns the authenticated user configuration and
+  virtual filesystem. The proxy calls finalize only after authentication has
+  succeeded.
+
+For a password-only integration, `authBackend.url` may instead name one
+single-step endpoint. The proxy sends the username, password, method, and
+connection metadata in one `POST`; a successful response returns the same user
+configuration as finalize. This mode does not offer public-key authentication.
+
+The backend may reject a request with a normal HTTP status code. `401` and
+`403` reject authentication, `404` means the user is unknown, and `5xx` or a
+malformed response fail the authentication attempt without exposing backend
+details to the client. The exact JSON schemas are versioned by these endpoint
+paths and must be documented beside the implementation.
+
+Each SSH connection owns an HTTP cookie jar. It is reused for that connection's
+authentication and filesystem requests only. The proxy adds `X-Forwarded-For`,
+`X-Forwarded-Proto: ssh`, and `X-Forwarded-Host` when meaningful. Backend URLs
+may use HTTP or HTTPS as configured. Redirects follow normal user-agent cookie
+origin rules and must not escape the configured backend origin or path prefix.
+
+### HTTP Virtual Filesystem Contract
+
+All configured backend URLs are base URLs. A child name is appended as one URL
+path segment after validating it is a single relative filesystem component.
+The proxy must reject absolute paths, traversal (`.` or `..`), NUL bytes, and
+attempts to resolve outside the virtual root. It never exposes backend URLs to
+the SFTP client.
+
+`GET` is used for directory listings and downloads. A successful directory
+listing has content type `application/vnd.sftproxy.directory+json` and the
+documented `children` shape. A successful file response is streamed to the
+client; `Content-Length`, `Last-Modified`, and `ETag` provide synthetic SFTP
+metadata when present. Byte offsets use RFC 9110 `Range` requests and responses
+are streamed rather than buffered in memory.
+
+Directory listing file entries may include a non-negative `size` field. The
+proxy uses it as the synthetic SFTP file size so clients that stat before
+reading, including OpenSSH, can transfer dynamic files correctly.
+
+Directory entries may include `allowed_methods` with any of `GET`, `POST`, and
+`DELETE`. When present, the proxy rejects other backend operations locally. In
+particular, a directory that excludes `GET` appears empty to SFTP clients
+without making an HTTP listing request.
+
+Files are uploaded by staging their SFTP writes in a private local directory.
+On a successful close, the proxy sends the completed content as `POST` with
+content type `application/octet-stream`. Aborted handles are discarded. Upload
+size and simultaneous-upload limits are optional configuration values per
+directory and per connection; when a count limit is reached, opening a new
+upload is rejected. Disk and memory resource limits otherwise remain an
+operational responsibility of the OS or container runtime.
+
+An empty `POST` with content type
+`application/vnd.sftpproxy.directoryentry` creates a directory. Plain `DELETE`
+deletes either a file or directory; the backend determines the target type.
+Rename is a `DELETE` to the source URL with a percent-encoded root-relative
+`renameTo` query parameter. The proxy rejects cross-backend renames.
+
+HTTP `403` maps to an SFTP permission error, `404` to no-such-file, `405` to
+operation-unsupported, and other non-success responses to a generic SFTP
+failure unless a more specific safe mapping is documented. A `405` while
+listing an upload-only directory is represented as an empty directory listing.
+
+The proxy supports the standard SFTP data operations needed by ordinary
+clients: list, stat, read, create, write, delete, rename, mkdir, and rmdir.
+Permission, owner, group, and timestamp updates succeed as synthetic no-ops.
+Operations requiring durable link semantics are unsupported until a backend
+contract for them exists.
+
+## Server
+The server should listen on IPv4+IPv6 on port 2222 on all interfaces unless otherwise configured.  
+
+## Connection establishment
+Once a connection is established, authentication should occur by first checking the configuration file for a configured user, then falling back to the configured HTTP backend URL.  
+
+The request should be an HTTP POST containing the details of the client connection required for the backend to authorize and resolve the attempt to a user.  The backend should return the configuration for the user if authorized (with the same schema as might be configured in a configuration file statically), or an appropriate HTTP status code if unacceptable.
+
+Authentication should be possible without the backend having special knowledge of the client protocol itself.  For example, if it is not commonly possible to evaluate public key authentication requests in an average HTTP backend, the proxy should handle the protocol-specific details and only send/request the necessary information to the backend.  As an example: this may mean that the proxy requests the backend perform authentication, and the backend reply that it cannot authenticate but provide the trusted public keys.  Subsequent requests would then be made with the proxy's assurance that the client has been authenticated according to the backend's policy.
+
+During a connection, the SFTP proxy server acts as the user-agent for the backend.  This includes the accumulation of cookies.  The backend should also be sent X-Forwarded-For, X-Forwarded-Proto, and other headers as is appropriate for a reverse proxy.
+
+## Virtual Filesystem
+After a connection has been established, the configuration provided either statically or dynamically from the backend shall be used to construct the virtual filesystem specific to the authenticated user.  The filesystem may be backed by a combination of one of three sources:
+
+1. Explicitly
+1. From local storage
+1. From an HTTP backend
+1. From an S3-compatible backend
+
+As an example, a config file or server may return for a user the following configuration:
+
+```json
+{
+  "rootfs": {
+    "children": [
+      {
+        "directory": "Inbound",
+        "backend": "http://foo.bar.baz/blah/inbound"
+      },
+      {
+        "directory": "Outbound",
+        "backend": "http://foo.bar.baz/blah/outbound"
+      },
+      {
+        "file": "README.md",
+        "backend": "http://foo.bar.baz/blah/readme"
+      },
+      {
+        "directory": "Archive",
+        "children": [
+          {
+            "directory": "2026",
+            "backend": "s3://foo.bar.baz/blah/archive/2026"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+When a client attempts to access a file or directory, the proxy should resolve the request against the virtual filesystem constructed for the authenticated user.  If the requested resource exists and the method is allowed, the proxy should forward the request to the appropriate backend.  If the resource does not exist or the method is not allowed, the proxy should return an appropriate error to the client.
+
+The proxy should seek to minimize the number of interactions required, while allowing for dynamic behavior.  Complexity should be minimized (e.g.: not requiring the backend to support complex filesystem behaviors by masking them in the proxy iteself).  Where the backend supports byte-range requests (RFC 9110), it should be used.  Most transferred files will be less than 50 MB, but it should never be assumed that a file will fit into memory.
+
+Backends may not support all HTTP methods or most filesystem behaviors.  Most backends likely only support either GET and POST.  Some might also support PUT and DELETE.
+
+The proxy should handle standard user-agent behaviors like following redirects presented by the backend.  Cookies origins should be respected to avoid information disclosure.
+
+### GET http://foo.bar.baz/blah/inbound
+The server might return HTTP 405 Method Not Allowed since the directory only accepts uploads.  An empty directory listing should be returned to the client.  If a 403 Forbidden would be returned, the access denied should be communicated appropriately.
+
+### POST http://foo.bar.baz/blah/inbound/Example%20file.txt
+HTTP 200 OK if the upload is successful.
+
+### GET http://foo.bar.baz/blah/inbound/Example%20file.txt 
+
+HTTP 405 Method Not Allowed since the file can only be uploaded.  Or, if the file were found, 200 OK with the file contents would be returned.
+
+### GET http://foo.bar.baz/blah/outbound
+HTTP 200 OK with content-type `application/vnd.sftproxy.directory+json` for a new directory listing.
+
+```json
+{
+  "children": [
+    {
+      "directory": "Example Subdirectory",
+      "children": [
+        {
+          "directory": "Nested Subdirectory",
+          "children": [
+            {
+              "file": "Nested File.txt",
+              "backend": "http://foo.bar.baz/blah/outbound/example-subdirectory/nested-subdirectory/nested-file.txt"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "Example File.txt",
+      "backend": "http://foo.bar.baz/blah/outbound/example-file.txt"
+    }
+  ]
+}
+```
+
+### DELETE http://foo.bar.baz/blah/outbound/Example%20file.txt
+HTTP 200 OK if the deletion is successful, or other appropriate HTTP status code if not.
+
+### DELETE http://foo.bar.baz/blah/outbound/Example%20file.txt?renameTo=%2Foutbound%2FNew%20Name.txt
+HTTP 200 OK if the rename is successful, or other appropriate HTTP status code if not.
+
+## Out of scope
+
+- Complex filesystem behaviors on the backend (e.g., server-side symlinks, permissions, properties of files)
+
+## General Considerations
+
+- YAGNI
+- Keep the proxy simple and avoid adding features that are not strictly necessary for the core functionality.
+- Prioritize security and correctness over performance optimizations unless they are clearly beneficial.
+- Avoid exposing sensitive information such as authentication credentials and backend URLs to unauthorized clients.
+- Clean design will beat clever hacks.

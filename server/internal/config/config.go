@@ -96,7 +96,20 @@ func (u User) ClientAlive() (interval time.Duration, countMax int) {
 }
 
 type RootFS struct {
-	Children []Entry `json:"children"`
+	Backend        string   `json:"backend,omitempty"`
+	AllowedMethods []string `json:"allowed_methods,omitempty"`
+	Children       []Entry  `json:"children,omitempty"`
+}
+
+// Entry views the root as the directory node it is, so that resolution,
+// listing, and method checks treat it no differently from any other directory.
+func (r RootFS) Entry() Entry {
+	return Entry{
+		Directory:      "/",
+		Backend:        r.Backend,
+		AllowedMethods: r.AllowedMethods,
+		Children:       r.Children,
+	}
 }
 
 type Entry struct {
@@ -215,7 +228,21 @@ func (u User) Validate() error {
 }
 
 func (r RootFS) Validate() error {
+	if r.Backend != "" {
+		if err := validateBackendURL(r.Backend); err != nil {
+			return err
+		}
+	}
+	if err := validateMethods(r.AllowedMethods); err != nil {
+		return err
+	}
 	return validateChildren(r.Children, "rootfs")
+}
+
+// ValidateEntries checks a list of sibling entries, as returned by a backend
+// directory listing.
+func ValidateEntries(entries []Entry) error {
+	return validateChildren(entries, "listing")
 }
 
 func validateChildren(children []Entry, location string) error {
@@ -250,9 +277,6 @@ func (e Entry) Validate() error {
 		if len(e.Children) != 0 {
 			return errors.New("file entries cannot have children")
 		}
-		if len(e.AllowedMethods) != 0 {
-			return errors.New("allowed_methods is only valid for directory entries")
-		}
 	}
 	if e.Directory != "" && e.Backend == "" && len(e.Children) == 0 {
 		return errors.New("directory entries require a backend or children")
@@ -262,15 +286,8 @@ func (e Entry) Validate() error {
 			return err
 		}
 	}
-	seenMethods := make(map[string]struct{}, len(e.AllowedMethods))
-	for _, method := range e.AllowedMethods {
-		if method != "GET" && method != "POST" && method != "DELETE" {
-			return fmt.Errorf("unsupported allowed method %q", method)
-		}
-		if _, exists := seenMethods[method]; exists {
-			return fmt.Errorf("duplicate allowed method %q", method)
-		}
-		seenMethods[method] = struct{}{}
+	if err := validateMethods(e.AllowedMethods); err != nil {
+		return err
 	}
 	return validateChildren(e.Children, e.name())
 }
@@ -299,6 +316,20 @@ func (u User) HasAuthorizedKey(key ssh.PublicKey) bool {
 		}
 	}
 	return false
+}
+
+func validateMethods(methods []string) error {
+	seen := make(map[string]struct{}, len(methods))
+	for _, method := range methods {
+		if method != "GET" && method != "POST" && method != "DELETE" {
+			return fmt.Errorf("unsupported allowed method %q", method)
+		}
+		if _, exists := seen[method]; exists {
+			return fmt.Errorf("duplicate allowed method %q", method)
+		}
+		seen[method] = struct{}{}
+	}
+	return nil
 }
 
 func validName(name string) bool {

@@ -29,9 +29,8 @@ type Filesystem struct {
 }
 
 type resolvedEntry struct {
-	entry       config.Entry
-	rootBackend string
-	allowed     []string
+	entry   config.Entry
+	allowed []string
 }
 
 func New(root config.RootFS, stagingDir string, client *http.Client) *Filesystem {
@@ -119,14 +118,11 @@ func (f *Filesystem) Filecmd(request *sftp.Request) error {
 		if !allows(entry.allowed, http.MethodDelete) {
 			return sftp.ErrSSHFxOpUnsupported
 		}
-		destination, err := f.resolveForWrite(request.Context(), request.Target)
-		if err != nil {
-			return err
+		target, err := virtualPathParts(request.Target)
+		if err != nil || len(target) == 0 {
+			return sftp.ErrSSHFxNoSuchFile
 		}
-		if entry.rootBackend != destination.rootBackend {
-			return sftp.ErrSSHFxOpUnsupported
-		}
-		query := url.Values{"renameTo": []string{cleanVirtualPath(request.Target)}}
+		query := url.Values{"renameTo": []string{"/" + strings.Join(target, "/")}}
 		parsed, err := url.Parse(entry.entry.Backend)
 		if err != nil {
 			return sftp.ErrSSHFxFailure
@@ -165,44 +161,39 @@ func (f *Filesystem) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 	return lister{entries: files}, nil
 }
 
+// resolve maps a virtual SFTP path onto the backend entry that serves it.
 func (f *Filesystem) resolve(ctx context.Context, rawPath string) (resolvedEntry, error) {
 	parts, err := virtualPathParts(rawPath)
 	if err != nil {
 		return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
 	}
+	root := f.root.Entry()
 	if len(parts) == 0 {
-		return resolvedEntry{entry: config.Entry{Directory: "/", Children: f.root.Children}}, nil
+		return resolvedEntry{entry: root, allowed: root.AllowedMethods}, nil
 	}
 
-	children := f.root.Children
-	var current config.Entry
-	var rootBackend string
-	var allowed []string
-	for index, part := range parts {
-		current, err = findChild(children, part)
-		if err != nil {
+	children, err := f.children(ctx, root)
+	if err != nil {
+		return resolvedEntry{}, err
+	}
+	for _, part := range parts[:len(parts)-1] {
+		directory, err := findChild(children, part)
+		if err != nil || directory.Directory == "" {
 			return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
 		}
-		if index == 0 {
-			rootBackend = current.Backend
-		}
-		if index == len(parts)-1 && current.Directory != "" {
-			allowed = current.AllowedMethods
-		}
-		if index < len(parts)-1 {
-			if current.Directory == "" {
-				return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
-			}
-			children, err = f.children(ctx, current)
-			if err != nil {
-				return resolvedEntry{}, err
-			}
-			allowed = current.AllowedMethods
+		if children, err = f.children(ctx, directory); err != nil {
+			return resolvedEntry{}, err
 		}
 	}
-	return resolvedEntry{entry: current, rootBackend: rootBackend, allowed: allowed}, nil
+
+	entry, err := findChild(children, parts[len(parts)-1])
+	if err != nil {
+		return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
+	}
+	return resolvedEntry{entry: entry, allowed: entry.AllowedMethods}, nil
 }
 
+// resolveForWrite resolves a path that a create may bring into existence.
 func (f *Filesystem) resolveForWrite(ctx context.Context, rawPath string) (resolvedEntry, error) {
 	entry, err := f.resolve(ctx, rawPath)
 	if err == nil {
@@ -226,9 +217,8 @@ func (f *Filesystem) resolveForWrite(ctx context.Context, rawPath string) (resol
 		return resolvedEntry{}, sftp.ErrSSHFxFailure
 	}
 	return resolvedEntry{
-		entry:       config.Entry{File: parts[len(parts)-1], Backend: backendURL},
-		rootBackend: parent.rootBackend,
-		allowed:     parent.entry.AllowedMethods,
+		entry:   config.Entry{File: parts[len(parts)-1], Backend: backendURL},
+		allowed: parent.entry.AllowedMethods,
 	}, nil
 }
 
@@ -264,7 +254,7 @@ func (f *Filesystem) children(ctx context.Context, entry config.Entry) ([]config
 	if err := decoder.Decode(&listing); err != nil {
 		return nil, sftp.ErrSSHFxFailure
 	}
-	if err := (config.RootFS{Children: listing.Children}).Validate(); err != nil {
+	if err := config.ValidateEntries(listing.Children); err != nil {
 		return nil, sftp.ErrSSHFxFailure
 	}
 	return listing.Children, nil
@@ -328,11 +318,6 @@ func virtualPathParts(rawPath string) ([]string, error) {
 		}
 	}
 	return parts, nil
-}
-
-func cleanVirtualPath(rawPath string) string {
-	parts, _ := virtualPathParts(rawPath)
-	return "/" + strings.Join(parts, "/")
 }
 
 func findChild(children []config.Entry, name string) (config.Entry, error) {

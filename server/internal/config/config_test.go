@@ -35,6 +35,24 @@ func TestConfigValidateAcceptsStaticHTTPUser(t *testing.T) {
 	}
 }
 
+func TestRootFSValidatesItsOwnBackendAndMethods(t *testing.T) {
+	root := RootFS{Backend: "https://files.example.test/root", AllowedMethods: []string{"GET", "POST"}}
+	if err := root.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if err := (RootFS{Backend: "ftp://files.example.test"}).Validate(); err == nil {
+		t.Fatal("Validate() accepted a non-HTTP root backend")
+	}
+	if err := (RootFS{Backend: "https://files.example.test", AllowedMethods: []string{"PUT"}}).Validate(); err == nil {
+		t.Fatal("Validate() accepted an unsupported root method")
+	}
+	// A root with neither backend nor children is an empty filesystem, not an
+	// error, and is what an empty backend listing validates as.
+	if err := (RootFS{}).Validate(); err != nil {
+		t.Fatalf("Validate() on an empty root error = %v", err)
+	}
+}
+
 func TestConfigValidateRejectsInvalidAllowedMethod(t *testing.T) {
 	entry := Entry{Directory: "Inbound", Backend: "https://files.example.test/inbound", AllowedMethods: []string{"PUT"}}
 	if err := entry.Validate(); err == nil {

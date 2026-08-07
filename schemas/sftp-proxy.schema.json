@@ -108,8 +108,10 @@
     "rootfs": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["children"],
+      "description": "The root directory node. Like any directory it may have a backend, its own allowed_methods, or statically configured children; a backend is what makes the root itself listable and writable.",
       "properties": {
+        "backend": { "type": "string", "format": "uri" },
+        "allowed_methods": { "$ref": "#/$defs/allowedMethods" },
         "children": {
           "type": "array",
           "items": { "$ref": "#/$defs/entry" }
@@ -130,8 +132,7 @@
           "if": { "required": ["file"] },
           "then": {
             "required": ["backend"],
-            "properties": { "children": { "maxItems": 0 } },
-            "not": { "required": ["allowed_methods"] }
+            "properties": { "children": { "maxItems": 0 } }
           }
         },
         {
@@ -148,12 +149,7 @@
         "directory": { "$ref": "#/$defs/name" },
         "file": { "$ref": "#/$defs/name" },
         "backend": { "type": "string", "format": "uri" },
-        "allowed_methods": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": { "enum": ["GET", "POST", "DELETE"] },
-          "description": "HTTP methods the proxy may send to this directory. An omitted value allows all supported methods."
-        },
+        "allowed_methods": { "$ref": "#/$defs/allowedMethods" },
         "size": { "type": "integer", "minimum": 0 },
         "children": {
           "type": "array",
@@ -167,6 +163,12 @@
       "type": "string",
       "minLength": 1,
       "pattern": "^(?!\\.{1,2}$)[^/\\\\\\u0000]+$"
+    },
+    "allowedMethods": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["GET", "POST", "DELETE"] },
+      "description": "HTTP methods the proxy may send to this node. Applies to that node alone and is never inherited by or from another. An omitted value allows all supported methods."
     }
   }
 }

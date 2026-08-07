@@ -52,8 +52,8 @@ privately by the proxy, so an incomplete SFTP upload is never sent.
 
 `allowed_methods` keeps `Inbound` drop-only: the proxy returns an empty client
 listing without sending a `GET` to the backend, and only sends `POST` for an
-upload. The value accepts `GET`, `POST`, and `DELETE`; omit it for a directory
-that supports all of those methods.
+upload. The value accepts `GET`, `POST`, and `DELETE`; omit it for an entry that
+supports all of those methods.
 
 Start the server from the repository root:
 

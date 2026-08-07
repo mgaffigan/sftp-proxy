@@ -58,6 +58,14 @@ The proxy must reject absolute paths, traversal (`.` or `..`), NUL bytes, and
 attempts to resolve outside the virtual root. It never exposes backend URLs to
 the SFTP client.
 
+`rootfs` is the root directory node and behaves as any other directory does. It
+may carry a `backend`, its own `allowed_methods`, statically configured
+`children`, or any combination. A root with a backend is listed by `GET`ting
+that backend and is uploaded into by `POST`ing to a child of it, so clients can
+work directly in `/` without a directory being configured first. A root with
+only `children` serves them statically and, having no URL, accepts no uploads
+of its own. As with any directory, a backend supersedes static children.
+
 `GET` is used for directory listings and downloads. A successful directory
 listing has content type `application/vnd.sftproxy.directory+json` and the
 documented `children` shape. A successful file response is streamed to the
@@ -69,10 +77,20 @@ Directory listing file entries may include a non-negative `size` field. The
 proxy uses it as the synthetic SFTP file size so clients that stat before
 reading, including OpenSSH, can transfer dynamic files correctly.
 
-Directory entries may include `allowed_methods` with any of `GET`, `POST`, and
-`DELETE`. When present, the proxy rejects other backend operations locally. In
-particular, a directory that excludes `GET` appears empty to SFTP clients
-without making an HTTP listing request.
+Any entry, file or directory, may include `allowed_methods` with any of `GET`,
+`POST`, and `DELETE`. When present, the proxy rejects other backend operations
+locally. In particular, a directory that excludes `GET` appears empty to SFTP
+clients without making an HTTP listing request.
+
+`allowed_methods` describes the entry that carries it and nothing else. It is
+never inherited from a parent, never combined with an ancestor's, and never
+consulted on one entry to decide an operation on another, so a writable file
+may sit inside a read-only directory and a read-only file inside a writable
+one. An entry that omits it permits every supported method, which means a
+backend restricting a file must say so on that file. The single case where a
+containing directory decides is creation: a path that does not exist yet has no
+entry of its own, so `POST` on the directory that would contain it is the
+permission to create within it.
 
 Files are uploaded by staging their SFTP writes in a private local directory.
 On a successful close, the proxy sends the completed content as `POST` with
@@ -86,7 +104,11 @@ An empty `POST` with content type
 `application/vnd.sftpproxy.directoryentry` creates a directory. Plain `DELETE`
 deletes either a file or directory; the backend determines the target type.
 Rename is a `DELETE` to the source URL with a percent-encoded root-relative
-`renameTo` query parameter. The proxy rejects cross-backend renames.
+`renameTo` query parameter. Being one `DELETE` on one entry, it is governed by
+the source's `allowed_methods` alone. The proxy does not interpret the
+destination beyond validating the path: whether a rename to it is possible,
+including one that lands under a different backend, is the source backend's
+answer to give.
 
 HTTP `403` maps to an SFTP permission error, `404` to no-such-file, `405` to
 operation-unsupported, and other non-success responses to a generic SFTP

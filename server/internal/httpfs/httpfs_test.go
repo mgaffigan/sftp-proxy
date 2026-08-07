@@ -154,6 +154,225 @@ func TestFilesystemMapsNotFoundToSFTPError(t *testing.T) {
 	}
 }
 
+// deletions records every DELETE the backend receives, and serves a tree in
+// which each entry's allowed_methods disagree with its directory's, so that any
+// inheritance would show up as a wrong answer.
+func mixedMethodsBackend(t *testing.T, deletions *[]string) (*httptest.Server, *Filesystem) {
+	t.Helper()
+	var backend *httptest.Server
+	backend = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete {
+			*deletions = append(*deletions, request.URL.RequestURI())
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		writer.Header().Set("Content-Type", directoryContentType)
+		switch request.URL.Path {
+		case "/files":
+			_, _ = writer.Write([]byte(`{"children":[
+				{"directory":"readonly","backend":"` + backend.URL + `/files/readonly","allowed_methods":["GET"]},
+				{"directory":"writable","backend":"` + backend.URL + `/files/writable","allowed_methods":["GET","POST","DELETE"]}
+			]}`))
+		case "/files/readonly":
+			_, _ = writer.Write([]byte(`{"children":[
+				{"file":"mutable.txt","backend":"` + backend.URL + `/files/readonly/mutable.txt","allowed_methods":["GET","POST","DELETE"]},
+				{"file":"frozen.txt","backend":"` + backend.URL + `/files/readonly/frozen.txt","allowed_methods":["GET"]}
+			]}`))
+		case "/files/writable":
+			_, _ = writer.Write([]byte(`{"children":[
+				{"file":"frozen.txt","backend":"` + backend.URL + `/files/writable/frozen.txt","allowed_methods":["GET"]}
+			]}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	filesystem := New(config.RootFS{Children: []config.Entry{{
+		Directory: "Files",
+		Backend:   backend.URL + "/files",
+	}}}, t.TempDir(), backend.Client())
+	return backend, filesystem
+}
+
+func TestFilesystemRootWithBackendListsUploadsAndResolves(t *testing.T) {
+	var uploaded string
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.URL.Path == "/root" && request.Method == http.MethodGet:
+			writer.Header().Set("Content-Type", directoryContentType)
+			_, _ = writer.Write([]byte(`{"children":[{"file":"existing.txt","size":2,"backend":"http://` + request.Host + `/root/existing.txt"}]}`))
+		case request.URL.Path == "/root/new.txt" && request.Method == http.MethodPost:
+			contents, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			uploaded = string(contents)
+			writer.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer backend.Close()
+
+	filesystem := New(config.RootFS{Backend: backend.URL + "/root"}, t.TempDir(), backend.Client())
+
+	// The root lists from its backend, with no statically configured children.
+	lister, err := filesystem.Filelist(sftp.NewRequest("List", "/"))
+	if err != nil {
+		t.Fatalf("Filelist(/) error = %v", err)
+	}
+	entries := make([]os.FileInfo, 1)
+	if count, err := lister.ListAt(entries, 0); count != 1 || err != nil {
+		t.Fatalf("ListAt() = (%d, %v), want (1, nil)", count, err)
+	}
+	if entries[0].Name() != "existing.txt" {
+		t.Fatalf("entry name = %q, want existing.txt", entries[0].Name())
+	}
+
+	// A child of the backend-listed root resolves like any other child.
+	if _, err := filesystem.Filelist(sftp.NewRequest("Stat", "/existing.txt")); err != nil {
+		t.Fatalf("Filelist(Stat) error = %v", err)
+	}
+
+	// Uploading into the root POSTs to the root backend's URL.
+	writer, err := filesystem.Filewrite(sftp.NewRequest("Put", "/new.txt").WithContext(context.Background()))
+	if err != nil {
+		t.Fatalf("Filewrite(/new.txt) error = %v", err)
+	}
+	if _, err := writer.WriteAt([]byte("hi"), 0); err != nil {
+		t.Fatalf("WriteAt() error = %v", err)
+	}
+	if err := writer.(io.Closer).Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if uploaded != "hi" {
+		t.Fatalf("uploaded = %q, want hi", uploaded)
+	}
+}
+
+func TestFilesystemRootMethodsApplyToTheRoot(t *testing.T) {
+	requests := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Method != http.MethodPost || request.URL.Path != "/root/drop.txt" {
+			t.Errorf("request = %s %s", request.Method, request.URL.Path)
+		}
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	// A drop-only root: POST but no GET, exactly as for a drop-only directory.
+	filesystem := New(config.RootFS{
+		Backend:        backend.URL + "/root",
+		AllowedMethods: []string{http.MethodPost},
+	}, t.TempDir(), backend.Client())
+
+	lister, err := filesystem.Filelist(sftp.NewRequest("List", "/"))
+	if err != nil {
+		t.Fatalf("Filelist(/) error = %v", err)
+	}
+	if count, err := lister.ListAt(make([]os.FileInfo, 1), 0); count != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("ListAt() = (%d, %v), want (0, EOF)", count, err)
+	}
+	if requests != 0 {
+		t.Fatalf("backend requests = %d, want the listing to be refused locally", requests)
+	}
+
+	writer, err := filesystem.Filewrite(sftp.NewRequest("Put", "/drop.txt"))
+	if err != nil {
+		t.Fatalf("Filewrite() error = %v", err)
+	}
+	if err := writer.(io.Closer).Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("backend requests = %d, want 1", requests)
+	}
+}
+
+func TestFilesystemAllowedMethodsAreNotInherited(t *testing.T) {
+	var deletions []string
+	backend, filesystem := mixedMethodsBackend(t, &deletions)
+	defer backend.Close()
+
+	// A mutable file inside a read-only directory is deletable: the file's own
+	// methods decide, and the directory's GET-only list is about the directory.
+	if err := filesystem.Filecmd(sftp.NewRequest("Remove", "/Files/readonly/mutable.txt")); err != nil {
+		t.Fatalf("Filecmd(Remove mutable) error = %v", err)
+	}
+	if len(deletions) != 1 || deletions[0] != "/files/readonly/mutable.txt" {
+		t.Fatalf("deletions = %v, want [/files/readonly/mutable.txt]", deletions)
+	}
+
+	// An immutable file inside a writable directory is not deletable, for the
+	// same reason read the other way round.
+	err := filesystem.Filecmd(sftp.NewRequest("Remove", "/Files/writable/frozen.txt"))
+	if !errors.Is(err, sftp.ErrSSHFxOpUnsupported) {
+		t.Fatalf("Filecmd(Remove frozen) error = %v, want op unsupported", err)
+	}
+	if len(deletions) != 1 {
+		t.Fatalf("deletions = %v, want the refused delete to reach no backend", deletions)
+	}
+}
+
+func TestFilesystemRenameConsultsOnlyTheSource(t *testing.T) {
+	var deletions []string
+	backend, filesystem := mixedMethodsBackend(t, &deletions)
+	defer backend.Close()
+
+	// Rename is one DELETE on the source, so the source's DELETE is the whole
+	// decision — the destination directory allowing only GET is irrelevant.
+	request := sftp.NewRequest("Rename", "/Files/readonly/mutable.txt")
+	request.Target = "/Files/readonly/renamed.txt"
+	if err := filesystem.Filecmd(request); err != nil {
+		t.Fatalf("Filecmd(Rename) error = %v", err)
+	}
+	want := "/files/readonly/mutable.txt?renameTo=%2FFiles%2Freadonly%2Frenamed.txt"
+	if len(deletions) != 1 || deletions[0] != want {
+		t.Fatalf("deletions = %v, want [%s]", deletions, want)
+	}
+
+	// A source without DELETE cannot be renamed.
+	request = sftp.NewRequest("Rename", "/Files/readonly/frozen.txt")
+	request.Target = "/Files/readonly/thawed.txt"
+	if err := filesystem.Filecmd(request); !errors.Is(err, sftp.ErrSSHFxOpUnsupported) {
+		t.Fatalf("Filecmd(Rename frozen) error = %v, want op unsupported", err)
+	}
+	if len(deletions) != 1 {
+		t.Fatalf("deletions = %v, want the refused rename to reach no backend", deletions)
+	}
+}
+
+func TestFilesystemRenamePassesUnresolvableTargetsToTheBackend(t *testing.T) {
+	var deletions []string
+	backend, filesystem := mixedMethodsBackend(t, &deletions)
+	defer backend.Close()
+
+	// The destination need not resolve, or even exist: the source backend
+	// decides what renameTo it will accept.
+	request := sftp.NewRequest("Rename", "/Files/readonly/mutable.txt")
+	request.Target = "/Nowhere/at/all.txt"
+	if err := filesystem.Filecmd(request); err != nil {
+		t.Fatalf("Filecmd(Rename) error = %v", err)
+	}
+	want := "/files/readonly/mutable.txt?renameTo=%2FNowhere%2Fat%2Fall.txt"
+	if len(deletions) != 1 || deletions[0] != want {
+		t.Fatalf("deletions = %v, want [%s]", deletions, want)
+	}
+
+	// A malformed destination is still refused, since renameTo must be a
+	// well-formed root-relative path.
+	for _, target := range []string{"", "relative.txt", "/Files/../escape.txt", "/"} {
+		request = sftp.NewRequest("Rename", "/Files/readonly/mutable.txt")
+		request.Target = target
+		if err := filesystem.Filecmd(request); !errors.Is(err, sftp.ErrSSHFxNoSuchFile) {
+			t.Fatalf("Filecmd(Rename to %q) error = %v, want no such file", target, err)
+		}
+	}
+	if len(deletions) != 1 {
+		t.Fatalf("deletions = %v, want the refused renames to reach no backend", deletions)
+	}
+}
+
 func TestRangeReaderReturnsEOFForShortFinalRange(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Range") != "bytes=0-7" {

@@ -1,12 +1,16 @@
 package auth
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 
 	"sftp-proxy/internal/config"
 )
@@ -90,6 +94,33 @@ func TestPasswordAuthenticationWithSingleEndpoint(t *testing.T) {
 	}
 }
 
+// authBackend.url mode is password-only, so a public-key attempt must be
+// rejected outright rather than reaching the backend.
+func TestPublicKeyIsRejectedWithSingleEndpoint(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, httpRequest *http.Request) {
+		t.Errorf("backend called for %s %s", httpRequest.Method, httpRequest.URL.Path)
+		http.NotFound(writer, httpRequest)
+	}))
+	defer backend.Close()
+
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL + "/auth"}}).NewConn()
+	if _, ok := authConn.backend.(*simpleAuth); !ok {
+		t.Fatalf("backend = %T, want *simpleAuth", authConn.backend)
+	}
+	if _, err := authConn.PublicKey(testConnection{username: "acme"}, key); err == nil {
+		t.Fatal("PublicKey() succeeded in single-endpoint mode, want failure")
+	}
+}
+
 func TestEndpointURLPreservesBasePath(t *testing.T) {
 	cases := []struct {
 		baseURL string
@@ -134,8 +165,12 @@ func TestLookupIsNotReusedAcrossUsernames(t *testing.T) {
 	defer backend.Close()
 
 	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn()
+	fullBackend, ok := authConn.backend.(*fullAuth)
+	if !ok {
+		t.Fatalf("backend = %T, want *fullAuth", authConn.backend)
+	}
 	for _, username := range []string{"acme", "acme", "other", "other"} {
-		if _, err := authConn.lookupPolicy(testConnection{username: username}); err != nil {
+		if _, err := fullBackend.lookupPolicy(testConnection{username: username}); err != nil {
 			t.Fatalf("lookupPolicy(%q) error = %v", username, err)
 		}
 	}

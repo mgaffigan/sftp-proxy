@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"sftp-proxy/internal/config"
@@ -40,8 +41,8 @@ func TestPasswordAuthenticationFinalizesBackendSession(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	authenticator := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}})
-	permissions, err := authenticator.Password(testConnection{}, []byte("not logged"))
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn()
+	permissions, err := authConn.Password(testConnection{username: "acme"}, []byte("not logged"))
 	if err != nil {
 		t.Fatalf("Password() error = %v", err)
 	}
@@ -79,8 +80,8 @@ func TestPasswordAuthenticationWithSingleEndpoint(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	authenticator := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL + "/auth"}})
-	permissions, err := authenticator.Password(testConnection{}, []byte("secret"))
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL + "/auth"}}).NewConn()
+	permissions, err := authConn.Password(testConnection{username: "acme"}, []byte("secret"))
 	if err != nil {
 		t.Fatalf("Password() error = %v", err)
 	}
@@ -89,9 +90,63 @@ func TestPasswordAuthenticationWithSingleEndpoint(t *testing.T) {
 	}
 }
 
-type testConnection struct{}
+func TestEndpointURLPreservesBasePath(t *testing.T) {
+	cases := []struct {
+		baseURL string
+		want    string
+	}{
+		{"https://api.example.com", "https://api.example.com/v1/sftp/auth/lookup"},
+		{"https://api.example.com/", "https://api.example.com/v1/sftp/auth/lookup"},
+		{"https://api.example.com/sftp", "https://api.example.com/sftp/v1/sftp/auth/lookup"},
+		{"https://api.example.com/sftp/", "https://api.example.com/sftp/v1/sftp/auth/lookup"},
+		{"https://api.example.com/sftp?token=x", "https://api.example.com/sftp/v1/sftp/auth/lookup"},
+	}
+	for _, testCase := range cases {
+		got, err := endpointURL(testCase.baseURL, "lookup")
+		if err != nil {
+			t.Fatalf("endpointURL(%q) error = %v", testCase.baseURL, err)
+		}
+		if got != testCase.want {
+			t.Errorf("endpointURL(%q) = %q, want %q", testCase.baseURL, got, testCase.want)
+		}
+	}
+}
 
-func (testConnection) User() string          { return "acme" }
+// A client may change the user name between auth requests, so a policy cached
+// for one name must not be reused for another.
+func TestLookupIsNotReusedAcrossUsernames(t *testing.T) {
+	var lookedUp []string
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/sftp/auth/lookup" {
+			http.NotFound(writer, request)
+			return
+		}
+		var received struct {
+			Connection metadata `json:"connection"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+			t.Error(err)
+			return
+		}
+		lookedUp = append(lookedUp, received.Connection.Username)
+		_ = json.NewEncoder(writer).Encode(lookupResponse{Methods: []string{"password"}})
+	}))
+	defer backend.Close()
+
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn()
+	for _, username := range []string{"acme", "acme", "other", "other"} {
+		if _, err := authConn.lookupPolicy(testConnection{username: username}); err != nil {
+			t.Fatalf("lookupPolicy(%q) error = %v", username, err)
+		}
+	}
+	if want := []string{"acme", "other"}; !slices.Equal(lookedUp, want) {
+		t.Fatalf("lookups = %v, want %v", lookedUp, want)
+	}
+}
+
+type testConnection struct{ username string }
+
+func (c testConnection) User() string        { return c.username }
 func (testConnection) SessionID() []byte     { return []byte("session-id") }
 func (testConnection) ClientVersion() []byte { return []byte("SSH-2.0-client") }
 func (testConnection) ServerVersion() []byte { return []byte("SSH-2.0-server") }

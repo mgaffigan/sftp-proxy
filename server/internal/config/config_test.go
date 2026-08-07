@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -115,5 +116,62 @@ func TestLoadAcceptsSchemaDeclaration(t *testing.T) {
 	}
 	if config.Schema != "https://example.test/sftp-proxy.schema.json" {
 		t.Fatalf("Schema = %q", config.Schema)
+	}
+}
+
+// An omitted timeout takes its default; an explicit 0 means "no limit", which
+// is the OpenSSH meaning and must not be confused with the omitted case.
+func TestTimeoutDefaultsDistinguishOmittedFromZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{
+  "hostKeyFile": "host_key",
+  "loginGraceMs": 0,
+  "authBackend": {"url": "http://localhost:8080/auth", "timeoutMs": 5}
+}`
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := config.LoginGrace(); got != 0 {
+		t.Errorf("LoginGrace() = %v, want 0 (no limit)", got)
+	}
+	if got := config.AuthBackend.RequestTimeout(); got != 5*time.Millisecond {
+		t.Errorf("RequestTimeout() = %v, want 5ms", got)
+	}
+
+	var omitted Config
+	if got := omitted.LoginGrace(); got != DefaultLoginGrace {
+		t.Errorf("LoginGrace() = %v, want %v", got, DefaultLoginGrace)
+	}
+	if got := omitted.AuthBackend.RequestTimeout(); got != DefaultAuthBackendTimeout {
+		t.Errorf("RequestTimeout() on nil backend = %v, want %v", got, DefaultAuthBackendTimeout)
+	}
+}
+
+func TestClientAliveDefaultsAndClamping(t *testing.T) {
+	never := 0
+	negative := -1
+	cases := []struct {
+		name         string
+		user         User
+		wantInterval time.Duration
+		wantCountMax int
+	}{
+		{"omitted disables probing", User{}, 0, DefaultClientAliveCountMax},
+		{"interval only takes default count", User{ClientAliveMs: 30}, 30 * time.Millisecond, DefaultClientAliveCountMax},
+		{"explicit zero count never terminates", User{ClientAliveMs: 30, ClientAliveCountMax: &never}, 30 * time.Millisecond, 0},
+		{"negatives from a backend are clamped", User{ClientAliveMs: -5, ClientAliveCountMax: &negative}, 0, 0},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			interval, countMax := testCase.user.ClientAlive()
+			if interval != testCase.wantInterval || countMax != testCase.wantCountMax {
+				t.Fatalf("ClientAlive() = %v, %d, want %v, %d", interval, countMax, testCase.wantInterval, testCase.wantCountMax)
+			}
+		})
 	}
 }

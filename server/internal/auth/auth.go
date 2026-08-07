@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"sync"
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/ssh"
@@ -22,14 +22,34 @@ type Session struct {
 	Client *http.Client
 }
 
+// Authenticator holds the configuration shared by every connection. It carries
+// no per-connection state; that lives in Conn.
 type Authenticator struct {
-	config   config.Config
-	attempts sync.Map
+	config config.Config
 }
 
-type attempt struct {
+// Conn is the authentication state for one SSH connection. It owns the cookie
+// jar shared by that connection's authentication and filesystem requests, and
+// caches the backend's lookup response so the repeated auth callbacks of one
+// handshake need only one lookup POST.
+//
+// A Conn is created by the connection's goroutine and referenced only by the
+// ssh.ServerConfig callbacks for that connection, so its lifetime is the
+// socket's: when the connection goes away, so does the jar. Nothing needs to be
+// swept, and there is no shared map to grow.
+//
+// Conn is not safe for concurrent use. It does not need to be: x/crypto/ssh
+// dispatches one connection's auth callbacks sequentially from that
+// connection's handshake goroutine.
+type Conn struct {
+	auth   *Authenticator
 	client *http.Client
-	lookup lookupResponse
+
+	// lookup caches the policy the backend returned for lookedUpUser. SSH lets a
+	// client change the user name between auth requests, so a cached policy is
+	// only valid for the name it was fetched under.
+	lookedUpUser string
+	lookup       *lookupResponse
 }
 
 type lookupResponse struct {
@@ -62,31 +82,36 @@ func New(cfg config.Config) *Authenticator {
 	return &Authenticator{config: cfg}
 }
 
-func (a *Authenticator) Password(connection ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-	if user, found := a.config.StaticUser(connection.User()); found {
+// NewConn starts authentication state for one SSH connection. The caller owns
+// the result and must not share it between connections.
+func (a *Authenticator) NewConn() *Conn {
+	return &Conn{auth: a, client: newClient()}
+}
+
+func (c *Conn) Password(connection ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+	if user, found := c.auth.config.StaticUser(connection.User()); found {
 		if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), password) != nil {
 			return nil, errors.New("authentication failed")
 		}
-		return permissions(user, newClient()), nil
+		return c.permissions(user), nil
 	}
-	if a.config.AuthBackend != nil && a.config.AuthBackend.URL != "" {
-		return a.singleEndpointPassword(connection, password)
+	if c.auth.config.AuthBackend != nil && c.auth.config.AuthBackend.URL != "" {
+		return c.singleEndpointPassword(connection, password)
 	}
 
-	attempt, err := a.lookup(connection)
-	if err != nil || !allows(attempt.lookup.Methods, "password") {
+	lookup, err := c.lookupPolicy(connection)
+	if err != nil || !allows(lookup.Methods, "password") {
 		return nil, errors.New("authentication failed")
 	}
-	if err := a.post(connection, attempt.client, "password", request{Connection: fromConnection(connection), Password: string(password)}, nil); err != nil {
+	if err := c.post(connection, "password", request{Connection: fromConnection(connection), Password: string(password)}, nil); err != nil {
 		return nil, errors.New("authentication failed")
 	}
-	return a.finalize(connection, attempt.client, "password", "")
+	return c.finalize(connection, "password", "")
 }
 
-func (a *Authenticator) singleEndpointPassword(connection ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-	client := newClient()
+func (c *Conn) singleEndpointPassword(connection ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 	var result finalizeResponse
-	if err := a.postToURL(connection, client, a.config.AuthBackend.URL, request{
+	if err := c.postToURL(connection, c.auth.config.AuthBackend.URL, request{
 		Connection: fromConnection(connection),
 		Password:   string(password),
 		Method:     "password",
@@ -99,22 +124,22 @@ func (a *Authenticator) singleEndpointPassword(connection ssh.ConnMetadata, pass
 	if result.User.Username != connection.User() || result.User.RootFS.Validate() != nil {
 		return nil, errors.New("authentication failed")
 	}
-	return permissions(result.User, client), nil
+	return c.permissions(result.User), nil
 }
 
-func (a *Authenticator) PublicKey(connection ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	if user, found := a.config.StaticUser(connection.User()); found {
+func (c *Conn) PublicKey(connection ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	if user, found := c.auth.config.StaticUser(connection.User()); found {
 		if !user.HasAuthorizedKey(key) {
 			return nil, errors.New("authentication failed")
 		}
-		return permissions(user, newClient()), nil
+		return c.permissions(user), nil
 	}
 
-	attempt, err := a.lookup(connection)
-	if err != nil || !allows(attempt.lookup.Methods, "publickey") || !matchesKey(attempt.lookup.AuthorizedKeys, key) {
+	lookup, err := c.lookupPolicy(connection)
+	if err != nil || !allows(lookup.Methods, "publickey") || !matchesKey(lookup.AuthorizedKeys, key) {
 		return nil, errors.New("authentication failed")
 	}
-	return a.finalize(connection, attempt.client, "publickey", ssh.FingerprintSHA256(key))
+	return c.finalize(connection, "publickey", ssh.FingerprintSHA256(key))
 }
 
 func SessionFrom(permissions *ssh.Permissions) (Session, bool) {
@@ -125,32 +150,27 @@ func SessionFrom(permissions *ssh.Permissions) (Session, bool) {
 	return session, found
 }
 
-func (a *Authenticator) lookup(connection ssh.ConnMetadata) (*attempt, error) {
-	if a.config.AuthBackend == nil {
+// lookupPolicy returns the backend's policy for the user this connection is
+// currently authenticating as, fetching it on first use.
+func (c *Conn) lookupPolicy(connection ssh.ConnMetadata) (*lookupResponse, error) {
+	if c.auth.config.AuthBackend == nil {
 		return nil, errors.New("no authentication backend")
 	}
-	id := string(connection.SessionID())
-	if existing, found := a.attempts.Load(id); found {
-		return existing.(*attempt), nil
+	if c.lookup != nil && c.lookedUpUser == connection.User() {
+		return c.lookup, nil
 	}
 
-	client := newClient()
 	var lookup lookupResponse
-	if err := a.post(connection, client, "lookup", request{Connection: fromConnection(connection)}, &lookup); err != nil || len(lookup.Methods) == 0 {
+	if err := c.post(connection, "lookup", request{Connection: fromConnection(connection)}, &lookup); err != nil || len(lookup.Methods) == 0 {
 		return nil, errors.New("authentication lookup failed")
 	}
-	created := &attempt{client: client, lookup: lookup}
-	actual, loaded := a.attempts.LoadOrStore(id, created)
-	if loaded {
-		return actual.(*attempt), nil
-	}
-	return created, nil
+	c.lookedUpUser, c.lookup = connection.User(), &lookup
+	return c.lookup, nil
 }
 
-func (a *Authenticator) finalize(connection ssh.ConnMetadata, client *http.Client, method, fingerprint string) (*ssh.Permissions, error) {
-	defer a.attempts.Delete(string(connection.SessionID()))
+func (c *Conn) finalize(connection ssh.ConnMetadata, method, fingerprint string) (*ssh.Permissions, error) {
 	var result finalizeResponse
-	if err := a.post(connection, client, "finalize", request{
+	if err := c.post(connection, "finalize", request{
 		Connection:  fromConnection(connection),
 		Method:      method,
 		Fingerprint: fingerprint,
@@ -163,29 +183,39 @@ func (a *Authenticator) finalize(connection ssh.ConnMetadata, client *http.Clien
 	if result.User.Username != connection.User() || result.User.RootFS.Validate() != nil {
 		return nil, errors.New("authentication failed")
 	}
-	return permissions(result.User, client), nil
+	return c.permissions(result.User), nil
 }
 
-func (a *Authenticator) post(connection ssh.ConnMetadata, client *http.Client, endpoint string, payload request, target any) error {
-	endpointURL, err := endpointURL(a.config.AuthBackend.BaseURL, endpoint)
+func (c *Conn) post(connection ssh.ConnMetadata, endpoint string, payload request, target any) error {
+	endpointURL, err := endpointURL(c.auth.config.AuthBackend.BaseURL, endpoint)
 	if err != nil {
 		return err
 	}
-	return a.postToURL(connection, client, endpointURL, payload, target)
+	return c.postToURL(connection, endpointURL, payload, target)
 }
 
-func (a *Authenticator) postToURL(connection ssh.ConnMetadata, client *http.Client, rawURL string, payload request, target any) error {
+func (c *Conn) postToURL(connection ssh.ConnMetadata, rawURL string, payload request, target any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	httpRequest, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(body))
+	// A hung backend must not pin the SSH handshake, so every auth POST — send,
+	// response, and decode — runs under one bounded context. The bound is
+	// per-request rather than an http.Client.Timeout because this same client is
+	// handed to the filesystem afterwards, where transfers may run much longer.
+	ctx := context.Background()
+	if timeout := c.auth.config.AuthBackend.RequestTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	addForwardedHeaders(httpRequest, connection)
-	requestClient := *client
+	requestClient := *c.client
 	requestClient.CheckRedirect = sameOriginRedirect(httpRequest.URL)
 	response, err := requestClient.Do(httpRequest)
 	if err != nil {
@@ -217,9 +247,13 @@ func endpointURL(baseURL, endpoint string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	parsed.Path = "/v1/sftp/auth/" + endpoint
-	parsed.RawQuery = ""
-	return parsed.String(), nil
+	// Join rather than replace: a baseURL may carry a path prefix the backend
+	// needs, so https://api.example.com/sftp must resolve to
+	// https://api.example.com/sftp/v1/sftp/auth/lookup.
+	joined := parsed.JoinPath("v1", "sftp", "auth", endpoint)
+	joined.RawQuery = ""
+	joined.Fragment = ""
+	return joined.String(), nil
 }
 
 func newClient() *http.Client {
@@ -230,8 +264,10 @@ func newClient() *http.Client {
 	return &http.Client{Jar: jar}
 }
 
-func permissions(user config.User, client *http.Client) *ssh.Permissions {
-	return &ssh.Permissions{ExtraData: map[any]any{sessionKey{}: Session{User: user, Client: client}}}
+// permissions hands the connection's client to the filesystem layer, so the
+// cookie jar built during authentication carries into the SFTP session.
+func (c *Conn) permissions(user config.User) *ssh.Permissions {
+	return &ssh.Permissions{ExtraData: map[any]any{sessionKey{}: Session{User: user, Client: c.client}}}
 }
 
 func fromConnection(connection ssh.ConnMetadata) metadata {

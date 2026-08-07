@@ -11,30 +11,88 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/ssh"
 )
+
+// Defaults for the tunables below. The two with an sshd_config(5) counterpart
+// use its default; DefaultAuthBackendTimeout has no OpenSSH analogue.
+const (
+	DefaultLoginGrace          = 120 * time.Second
+	DefaultClientAliveCountMax = 3
+	DefaultAuthBackendTimeout  = 30 * time.Second
+)
+
+// Millis is a duration configured in milliseconds. Settings that take one are
+// pointers so an omitted value can take its default while an explicit 0 keeps
+// the OpenSSH meaning of "no limit".
+type Millis int
+
+func (m Millis) Duration() time.Duration {
+	return time.Duration(m) * time.Millisecond
+}
 
 type Config struct {
 	Schema           string       `json:"$schema,omitempty"`
 	HostKeyFile      string       `json:"hostKeyFile"`
 	Port             int          `json:"port"`
 	UploadStagingDir string       `json:"uploadStagingDir"`
+	LoginGraceMs     *Millis      `json:"loginGraceMs,omitempty"`
 	AuthBackend      *AuthBackend `json:"authBackend,omitempty"`
 	Users            []User       `json:"users,omitempty"`
 }
 
 type AuthBackend struct {
-	BaseURL string `json:"baseURL"`
-	URL     string `json:"url,omitempty"`
+	BaseURL   string  `json:"baseURL"`
+	URL       string  `json:"url,omitempty"`
+	TimeoutMs *Millis `json:"timeoutMs,omitempty"`
 }
 
 type User struct {
-	Username       string   `json:"username"`
-	PasswordHash   string   `json:"passwordHash,omitempty"`
-	AuthorizedKeys []string `json:"authorizedKeys,omitempty"`
-	RootFS         RootFS   `json:"rootfs"`
+	Username            string   `json:"username"`
+	PasswordHash        string   `json:"passwordHash,omitempty"`
+	AuthorizedKeys      []string `json:"authorizedKeys,omitempty"`
+	ClientAliveMs       Millis   `json:"clientAliveMs,omitempty"`
+	ClientAliveCountMax *int     `json:"clientAliveCountMax,omitempty"`
+	RootFS              RootFS   `json:"rootfs"`
+}
+
+// LoginGrace reports how long a connection may take to authenticate, after
+// which it is disconnected. Zero means no limit. Server-wide, because it
+// applies before there is a user to consult.
+func (c Config) LoginGrace() time.Duration {
+	if c.LoginGraceMs == nil {
+		return DefaultLoginGrace
+	}
+	return c.LoginGraceMs.Duration()
+}
+
+// RequestTimeout bounds one HTTP request to the authentication backend. Zero
+// means no limit.
+func (a *AuthBackend) RequestTimeout() time.Duration {
+	if a == nil || a.TimeoutMs == nil {
+		return DefaultAuthBackendTimeout
+	}
+	return a.TimeoutMs.Duration()
+}
+
+// ClientAlive reports the post-authentication liveness policy: how long the
+// session may be idle before the server probes the client, and how many
+// consecutive unanswered probes end the connection. A zero interval disables
+// probing entirely; a zero count never terminates on a missed probe. Both match
+// ClientAliveInterval and ClientAliveCountMax in sshd_config(5).
+//
+// A User may come from an authentication backend rather than the config file,
+// where Validate does not run over these fields, so negatives are clamped here
+// rather than trusted.
+func (u User) ClientAlive() (interval time.Duration, countMax int) {
+	countMax = DefaultClientAliveCountMax
+	if u.ClientAliveCountMax != nil {
+		countMax = max(*u.ClientAliveCountMax, 0)
+	}
+	return max(u.ClientAliveMs.Duration(), 0), countMax
 }
 
 type RootFS struct {
@@ -92,6 +150,9 @@ func (c Config) Validate() error {
 	if c.UploadStagingDir == "" {
 		return errors.New("uploadStagingDir is required")
 	}
+	if c.LoginGraceMs != nil && *c.LoginGraceMs < 0 {
+		return errors.New("loginGraceMs cannot be negative")
+	}
 	if c.AuthBackend != nil {
 		if err := c.AuthBackend.Validate(); err != nil {
 			return fmt.Errorf("authBackend: %w", err)
@@ -118,6 +179,9 @@ func (a AuthBackend) Validate() error {
 	if (a.BaseURL == "") == (a.URL == "") {
 		return errors.New("exactly one of baseURL or url is required")
 	}
+	if a.TimeoutMs != nil && *a.TimeoutMs < 0 {
+		return errors.New("timeoutMs cannot be negative")
+	}
 	if a.BaseURL != "" {
 		return validateBackendURL(a.BaseURL)
 	}
@@ -140,6 +204,12 @@ func (u User) Validate() error {
 		if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(encodedKey)); err != nil {
 			return fmt.Errorf("authorizedKeys[%d]: %w", index, err)
 		}
+	}
+	if u.ClientAliveMs < 0 {
+		return errors.New("clientAliveMs cannot be negative")
+	}
+	if u.ClientAliveCountMax != nil && *u.ClientAliveCountMax < 0 {
+		return errors.New("clientAliveCountMax cannot be negative")
 	}
 	return u.RootFS.Validate()
 }

@@ -31,6 +31,12 @@
       "default": "staging",
       "description": "Private directory used while SFTP uploads are in progress."
     },
+    "loginGraceMs": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 120000,
+      "description": "Milliseconds a connection may take to authenticate before it is disconnected, as in sshd_config LoginGraceTime. 0 means no limit."
+    },
     "authBackend": { "$ref": "#/$defs/authBackend" },
     "users": {
       "type": "array",
@@ -55,6 +61,12 @@
           "type": "string",
           "format": "uri",
           "description": "Single endpoint for password authentication and filesystem setup."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 30000,
+          "description": "Milliseconds one HTTP request to the authentication backend may take. 0 means no limit."
         }
       }
     },
@@ -77,6 +89,18 @@
           "type": "array",
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 }
+        },
+        "clientAliveMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Milliseconds an authenticated session may go unanswered before the server probes the client, as in sshd_config ClientAliveInterval. 0 disables probing."
+        },
+        "clientAliveCountMax": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "Consecutive unanswered probes that end the connection, as in sshd_config ClientAliveCountMax. 0 never terminates on a missed probe."
         },
         "rootfs": { "$ref": "#/$defs/rootfs" }
       }

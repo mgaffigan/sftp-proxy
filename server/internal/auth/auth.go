@@ -280,9 +280,7 @@ func (b *backendClient) postTo(connection ssh.ConnMetadata, rawURL string, paylo
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	addForwardedHeaders(httpRequest, connection)
-	requestClient := *b.http
-	requestClient.CheckRedirect = sameOriginRedirect(httpRequest.URL)
-	response, err := requestClient.Do(httpRequest)
+	response, err := b.http.Do(httpRequest)
 	if err != nil {
 		return err
 	}
@@ -338,15 +336,6 @@ type request struct {
 	Password    string   `json:"password,omitempty"`
 	Method      string   `json:"method,omitempty"`
 	Fingerprint string   `json:"fingerprint,omitempty"`
-}
-
-func sameOriginRedirect(origin *url.URL) func(*http.Request, []*http.Request) error {
-	return func(request *http.Request, _ []*http.Request) error {
-		if request.URL.Scheme != origin.Scheme || request.URL.Host != origin.Host {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	}
 }
 
 func endpointURL(baseURL, endpoint string) (string, error) {

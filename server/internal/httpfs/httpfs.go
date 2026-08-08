@@ -157,27 +157,11 @@ func (b *Backend) do(ctx context.Context, method, rawURL, contentType string, bo
 		request.Header.Set("Content-Type", contentType)
 	}
 
-	client := *b.client
-	client.CheckRedirect = sameBackendRedirect(request.URL)
-	response, err := client.Do(request)
+	response, err := b.client.Do(request)
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}
 	return response, nil
-}
-
-func sameBackendRedirect(origin *url.URL) func(*http.Request, []*http.Request) error {
-	return func(request *http.Request, _ []*http.Request) error {
-		if request.URL.Scheme != origin.Scheme || request.URL.Host != origin.Host || !pathHasPrefix(request.URL.Path, origin.Path) {
-			return errors.New("redirect outside configured backend")
-		}
-		return nil
-	}
-}
-
-func pathHasPrefix(candidate, prefix string) bool {
-	prefix = strings.TrimSuffix(prefix, "/")
-	return candidate == prefix || strings.HasPrefix(candidate, prefix+"/")
 }
 
 // permits reports whether the proxy may send method to this node. An empty
@@ -269,9 +253,7 @@ func (r *rangeReader) request(offset int64, length int) (*http.Response, error) 
 	}
 	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(length)-1))
 
-	client := *r.backend.client
-	client.CheckRedirect = sameBackendRedirect(request.URL)
-	response, err := client.Do(request)
+	response, err := r.backend.client.Do(request)
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}

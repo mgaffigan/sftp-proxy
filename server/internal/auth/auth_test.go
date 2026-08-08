@@ -94,6 +94,34 @@ func TestPasswordAuthenticationWithSingleEndpoint(t *testing.T) {
 	}
 }
 
+func TestAuthenticationFollowsCrossOriginRedirects(t *testing.T) {
+	var elsewhere *httptest.Server
+	elsewhere = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			t.Errorf("redirected method = %s, want POST", request.Method)
+		}
+		_ = json.NewEncoder(writer).Encode(finalizeResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
+			Directory: "Inbound",
+			Backend:   elsewhere.URL + "/inbound",
+		}}}}})
+	}))
+	defer elsewhere.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, elsewhere.URL, http.StatusTemporaryRedirect)
+	}))
+	defer backend.Close()
+
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL}}).NewConn()
+	permissions, err := authConn.Password(testConnection{username: "acme"}, []byte("secret"))
+	if err != nil {
+		t.Fatalf("Password() through a cross-origin redirect = %v", err)
+	}
+	if session, found := SessionFrom(permissions); !found || session.User.Username != "acme" {
+		t.Fatalf("unexpected session: %#v, found=%v", session, found)
+	}
+}
+
 // authBackend.url mode is password-only, so a public-key attempt must be
 // rejected outright rather than reaching the backend.
 func TestPublicKeyIsRejectedWithSingleEndpoint(t *testing.T) {

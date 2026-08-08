@@ -398,30 +398,20 @@ func TestOpenRejectsATruncatedWholeFileFallback(t *testing.T) {
 	}
 }
 
-func TestRedirectsMayNotLeaveTheBackend(t *testing.T) {
+func TestRedirectsMayLeaveTheBackend(t *testing.T) {
 	elsewhere := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		t.Error("a redirect escaped the configured backend")
+		if request.Method != http.MethodDelete {
+			t.Errorf("redirected method = %s, want DELETE", request.Method)
+		}
+		writer.WriteHeader(http.StatusOK)
 	}))
 	defer elsewhere.Close()
 
 	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/base/away":
-			http.Redirect(writer, request, elsewhere.URL+"/", http.StatusFound)
-		case "/base/near":
-			http.Redirect(writer, request, "/base/near/final", http.StatusFound)
-		default:
-			writer.WriteHeader(http.StatusOK)
-		}
+		http.Redirect(writer, request, elsewhere.URL+"/signed", http.StatusTemporaryRedirect)
 	})
-	ctx := context.Background()
 
-	err := backend.Remove(ctx, vfs.Node{File: "away", Backend: url("/base/away")})
-	if !errors.Is(err, vfs.ErrFailure) {
-		t.Fatalf("Remove() across origins = %v, want failure", err)
-	}
-	// A redirect staying under the same base is followed normally.
-	if err := backend.Remove(ctx, vfs.Node{File: "near", Backend: url("/base/near")}); err != nil {
-		t.Fatalf("Remove() within the backend = %v", err)
+	if err := backend.Remove(context.Background(), vfs.Node{File: "away", Backend: url("/base/away")}); err != nil {
+		t.Fatalf("Remove() across origins = %v", err)
 	}
 }

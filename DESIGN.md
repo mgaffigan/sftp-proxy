@@ -181,7 +181,7 @@ URLs never carry credentials. Authenticating buckets occurs via two paths:
 * **Headers**: AWS transfer style metadata are included by default, and can be customized by an authentication backend.
 
 **Directory Model & Permissions**
-The backend exposes a pure virtual prefix tree without placeholder objects or `mkdir` support. Empty directories do not exist; any directory that must exist prior to population must be declared in configuration via its `s3://` prefix. `permissions` is rejected on S3 nodes; instead, `allowedMethods` names the S3 API calls the proxy may make against a node — `ListObjectsV2`, `GetObject`, `PutObject`, `DeleteObject`, `CopyObject`.
+The backend exposes a virtual prefix tree: a directory is the prefix its members share. 0-byte markers are used for directories with no files. `permissions` is rejected on S3 nodes; instead, `allowedMethods` names the S3 API calls the proxy may make against a node — `ListObjectsV2`, `GetObject`, `PutObject`, `DeleteObject`, `CopyObject`.
 
 ### SCP
 

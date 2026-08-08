@@ -47,8 +47,12 @@ run_scp acme@proxy-s3:/Inbound/s3-original.txt /tmp/s3-scp-downloaded.txt
 cmp /tmp/s3-original.txt /tmp/s3-scp-downloaded.txt
 printf 'rm Inbound/s3-original.txt\n' | run_sftp
 
-# There is no directory to make in a bucket, and no empty one to remove.
-if printf 'mkdir Inbound/openssh-directory\n' | run_sftp 2>/dev/null; then exit 1; fi
+# A directory with no members is the zero-byte marker at its own prefix, made
+# and unmade like the one AWS Transfer Family writes.
+printf 'mkdir Inbound/openssh-directory\n' | run_sftp
+list_inbound | grep -F 'openssh-directory'
+printf 'rmdir Inbound/openssh-directory\n' | run_sftp
+if list_inbound | grep -F 'openssh-directory'; then exit 1; fi
 
 printf 'rm Inbound/openssh-renamed.txt\n' | run_sftp
 if list_inbound | grep -F 'Inbound/openssh-renamed.txt'; then exit 1; fi

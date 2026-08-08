@@ -366,16 +366,83 @@ func TestCreateRefusesWhatAllowedMethodsWithholds(t *testing.T) {
 	}
 }
 
-// There is no directory to make: one here is the prefix its members share.
-func TestMkdirAndDirectoryRemovalAreUnsupported(t *testing.T) {
+// A directory with no members has no prefix to be found by, so making one
+// writes the marker at the prefix itself — which a listing then hides.
+func TestMkdirAndRemoveTheDirectoryMarker(t *testing.T) {
 	backend, fake, at := serve(t)
-	fake.put("docs/one.txt", "first")
+	ctx := context.Background()
 
-	if err := backend.Mkdir(context.Background(), directory(at("docs/sub"))); !errors.Is(err, vfs.ErrUnsupported) {
+	if err := backend.Mkdir(ctx, directory(at("docs/sub"))); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	if got := fake.keys(); strings.Join(got, ",") != "docs/sub/" {
+		t.Fatalf("keys = %v, want [docs/sub/]", got)
+	}
+	children, err := backend.List(ctx, directory(at("docs")))
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got := names(children); strings.Join(got, ",") != "dir sub" {
+		t.Fatalf("List() = %v, want [dir sub]", got)
+	}
+	if children, err := backend.List(ctx, directory(at("docs/sub"))); err != nil || len(children) != 0 {
+		t.Fatalf("List() of a fresh directory = %v, %v, want empty", names(children), err)
+	}
+
+	if err := backend.Remove(ctx, directory(at("docs/sub"))); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if got := fake.keys(); len(got) != 0 {
+		t.Fatalf("keys = %v, want none", got)
+	}
+}
+
+// Emptying a directory is a walk rather than a request, which is not what
+// rmdir asked for.
+func TestRemoveRefusesADirectoryWithMembers(t *testing.T) {
+	backend, fake, at := serve(t)
+	fake.put("docs/sub/", "")
+	fake.put("docs/sub/one.txt", "first")
+
+	if err := backend.Remove(context.Background(), directory(at("docs/sub"))); !errors.Is(err, vfs.ErrFailure) {
+		t.Fatalf("Remove() error = %v, want %v", err, vfs.ErrFailure)
+	}
+	if _, ok := fake.get("docs/sub/"); !ok {
+		t.Error("Remove() took the marker of a directory it refused to remove")
+	}
+}
+
+// The bucket root is always there, so it can be neither made nor removed.
+func TestMkdirAndRemoveRefuseTheBucketRoot(t *testing.T) {
+	backend, _, at := serve(t)
+	root := vfs.Node{Directory: "/", Backend: at("")}
+
+	if err := backend.Mkdir(context.Background(), root); !errors.Is(err, vfs.ErrUnsupported) {
 		t.Errorf("Mkdir() error = %v, want %v", err, vfs.ErrUnsupported)
 	}
-	if err := backend.Remove(context.Background(), directory(at("docs"))); !errors.Is(err, vfs.ErrUnsupported) {
-		t.Errorf("Remove() of a directory error = %v, want %v", err, vfs.ErrUnsupported)
+	if err := backend.Remove(context.Background(), root); !errors.Is(err, vfs.ErrUnsupported) {
+		t.Errorf("Remove() error = %v, want %v", err, vfs.ErrUnsupported)
+	}
+}
+
+func TestMkdirAndDirectoryRemovalObeyAllowedMethods(t *testing.T) {
+	backend, fake, at := serve(t)
+	fake.put("docs/sub/", "")
+	ctx := context.Background()
+
+	readOnly := directory(at("docs/sub"))
+	readOnly.AllowedMethods = []string{config.S3ListObjects, config.S3GetObject}
+	if err := backend.Mkdir(ctx, readOnly); !errors.Is(err, vfs.ErrPermission) {
+		t.Errorf("Mkdir() error = %v, want %v", err, vfs.ErrPermission)
+	}
+	if err := backend.Remove(ctx, readOnly); !errors.Is(err, vfs.ErrPermission) {
+		t.Errorf("Remove() error = %v, want %v", err, vfs.ErrPermission)
+	}
+	// A directory that cannot be listed cannot be shown to be empty either.
+	unlistable := directory(at("docs/sub"))
+	unlistable.AllowedMethods = []string{config.S3DeleteObject}
+	if err := backend.Remove(ctx, unlistable); !errors.Is(err, vfs.ErrPermission) {
+		t.Errorf("Remove() without ListObjectsV2 error = %v, want %v", err, vfs.ErrPermission)
 	}
 }
 

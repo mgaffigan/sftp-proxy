@@ -139,4 +139,5 @@ user. This replaces the default headers rather than adding to them. For example:
 
 - Listing a container prefix of more than 10,000 entries will only return the first 10,000.
 - Uploading files larger than 5 GiB are not supported.
-- Directories are virtual and cannot be created or removed explicitly.
+- Renaming a file moves it within the directory it is already in; a rename into
+  another directory is refused.

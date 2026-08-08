@@ -11,8 +11,10 @@
 //
 // Object stores have no directories, only keys that share a prefix. This
 // package presents that as it is: a listing reports the prefixes it finds
-// beneath a node, and there is no directory to create or remove because there
-// was never one to begin with.
+// beneath a node. A directory with no members would have no prefix to be found
+// by, so making one writes the zero-byte object at the prefix itself that AWS
+// Transfer Family, the S3 console, and mc all write for the same reason; a
+// listing hides it, since it names nothing within the directory.
 package s3fs
 
 import (
@@ -367,22 +369,67 @@ func (b *Backend) Create(ctx context.Context, node vfs.Node) (vfs.WriterAtCloser
 	})
 }
 
-// Mkdir has nothing to create. A directory here is the prefix its members
-// share, so one with no members does not exist to be made, and a placeholder
-// object standing in for it would be a file this proxy then had to hide.
-func (b *Backend) Mkdir(context.Context, vfs.Node) error {
-	return vfs.ErrUnsupported
+// Mkdir writes the marker: a zero-byte object at the prefix, which is the only
+// thing that can make a directory holding nothing else visible to a listing.
+// The bucket root is always there and so cannot be made.
+func (b *Backend) Mkdir(ctx context.Context, node vfs.Node) error {
+	at, err := b.resolve(node)
+	if err != nil {
+		return err
+	}
+	if at.key == "" {
+		return vfs.ErrUnsupported
+	}
+	if !permits(at.methods, config.S3PutObject) {
+		return vfs.ErrPermission
+	}
+	_, err = at.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(at.bucket),
+		Key:           aws.String(at.prefix()),
+		ContentLength: aws.Int64(0),
+		Metadata:      headers.From(ctx),
+	})
+	return outcome(ctx, err)
 }
 
-// Remove deletes an object. A directory is refused for the same reason it
-// cannot be created, and because emptying one is a walk rather than a request.
+// removeDirectory deletes a directory's marker, once the store has said the
+// prefix holds nothing else. Two keys are asked for because the first may be
+// the marker itself; anything beyond it is a member, and a directory with a
+// member is emptied by a walk rather than a request, which is not what rmdir
+// asked for.
+func (l location) removeDirectory(ctx context.Context) error {
+	if !permits(l.methods, config.S3ListObjects) || !permits(l.methods, config.S3DeleteObject) {
+		return vfs.ErrPermission
+	}
+	prefix := l.prefix()
+	listing, err := l.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(l.bucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(2),
+	})
+	if err != nil {
+		return outcome(ctx, err)
+	}
+	for _, object := range listing.Contents {
+		if aws.ToString(object.Key) != prefix {
+			return vfs.ErrFailure
+		}
+	}
+	return l.sibling(prefix).remove(ctx)
+}
+
+// Remove deletes an object, or an empty directory's marker. The bucket root is
+// neither.
 func (b *Backend) Remove(ctx context.Context, node vfs.Node) error {
 	at, err := b.resolve(node)
 	if err != nil {
 		return err
 	}
-	if node.IsDirectory() || at.key == "" {
+	if at.key == "" {
 		return vfs.ErrUnsupported
+	}
+	if node.IsDirectory() {
+		return at.removeDirectory(ctx)
 	}
 	if !permits(at.methods, config.S3DeleteObject) {
 		return vfs.ErrPermission

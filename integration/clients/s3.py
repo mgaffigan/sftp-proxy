@@ -87,9 +87,20 @@ sftp.remove(renamed)
 assert sftp.listdir("/Inbound") == []
 assert refused(lambda: sftp.remove(renamed))
 
-# A directory in a bucket is the prefix its members share, so there is none to
-# make and none to unmake.
-assert refused(lambda: sftp.mkdir("/Inbound/directory"))
+# A directory in a bucket is the prefix its members share, so one with no
+# members is a zero-byte marker at that prefix, which a listing hides.
+sftp.mkdir("/Inbound/directory")
+assert sftp.listdir("/Inbound") == ["directory"]
+assert sftp.listdir("/Inbound/directory") == []
+assert store.head_object(Bucket="acme-archive", Key="inbound/directory/")["ContentLength"] == 0
+# Emptying a directory is a walk rather than a request, and not what rmdir asks.
+with sftp.open("/Inbound/directory/held.txt", "wb") as destination:
+    destination.write(b"held")
+assert refused(lambda: sftp.rmdir("/Inbound/directory"))
+sftp.remove("/Inbound/directory/held.txt")
+sftp.rmdir("/Inbound/directory")
+assert sftp.listdir("/Inbound") == []
+# A directory whose allowedMethods withhold DeleteObject is refused as a file is.
 assert refused(lambda: sftp.rmdir("/Outbound"))
 
 # allowedMethods withholding PutObject/DeleteObject/CopyObject projects to

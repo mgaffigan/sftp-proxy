@@ -100,6 +100,34 @@ func TestStagedWriterLeavesNothingWhenTheCommitFails(t *testing.T) {
 	}
 }
 
+func TestStagedWriterDoesNotCommitAfterWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	committed := false
+	writer, err := NewStagedWriter(dir, func(io.Reader) error {
+		committed = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("NewStagedWriter() error = %v", err)
+	}
+
+	if _, err := writer.WriteAt([]byte("doomed"), -1); !errors.Is(err, ErrFailure) {
+		t.Fatalf("WriteAt() error = %v, want ErrFailure", err)
+	}
+	if _, err := writer.WriteAt([]byte("also doomed"), 0); !errors.Is(err, ErrFailure) {
+		t.Fatalf("WriteAt() error = %v, want ErrFailure", err)
+	}
+	if err := writer.Close(); !errors.Is(err, ErrFailure) {
+		t.Fatalf("Close() error = %v, want ErrFailure", err)
+	}
+	if committed {
+		t.Fatal("commit was called after a failed write")
+	}
+	if left := entries(t, dir); len(left) != 0 {
+		t.Fatalf("staging directory holds %v after a failed write", left)
+	}
+}
+
 func TestStagedWriterCommitsALargeSparseFileWhole(t *testing.T) {
 	dir := t.TempDir()
 	var size int

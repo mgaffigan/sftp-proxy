@@ -53,6 +53,7 @@ func (f *StagingFile) Close() error {
 type StagedWriter struct {
 	file   *StagingFile
 	commit func(io.Reader) error
+	err    error
 }
 
 // NewStagedWriter stages into dir, calling commit with the complete contents
@@ -66,9 +67,13 @@ func NewStagedWriter(dir string, commit func(io.Reader) error) (*StagedWriter, e
 }
 
 func (w *StagedWriter) WriteAt(data []byte, offset int64) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
 	count, err := w.file.WriteAt(data, offset)
 	if err != nil {
-		return count, ErrFailure
+		w.err = ErrFailure
+		return count, w.err
 	}
 	return count, nil
 }
@@ -78,6 +83,9 @@ func (w *StagedWriter) WriteAt(data []byte, offset int64) (int, error) {
 // there is no name left to reopen.
 func (w *StagedWriter) Close() error {
 	defer w.file.Close()
+	if w.err != nil {
+		return w.err
+	}
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return ErrFailure
 	}

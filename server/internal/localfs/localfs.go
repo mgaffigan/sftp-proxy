@@ -289,7 +289,21 @@ func (b *Backend) Rename(ctx context.Context, node vfs.Node, from, to string) er
 	if err := at.permitChange(ctx); err != nil {
 		return err
 	}
-	return outcome(ctx, at.root.Rename(at.rel, filepath.Join(filepath.Dir(at.rel), name)))
+	// Rename replaces whatever is at the destination, and SFTP says a rename
+	// that would do so is an error rather than a replacement.
+	//
+	// TOCTOU is possible but hard to avoid:
+	// - Renameat2 is linux only
+	// - Rename already protects on windows
+	// - and Renameexnp is mac only
+	target := filepath.Join(filepath.Dir(at.rel), name)
+	switch _, err := at.root.Stat(target); {
+	case err == nil:
+		return vfs.ErrExist
+	case !errors.Is(err, fs.ErrNotExist):
+		return outcome(ctx, err)
+	}
+	return outcome(ctx, at.root.Rename(at.rel, target))
 }
 
 // Child names a member of a directory, whether or not it exists yet, by

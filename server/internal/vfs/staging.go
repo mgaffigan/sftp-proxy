@@ -52,13 +52,17 @@ func (f *StagingFile) Close() error {
 // not use it.
 type StagedWriter struct {
 	file   *StagingFile
-	commit func(io.Reader) error
+	commit func(*StagingFile) error
 	err    error
 }
 
 // NewStagedWriter stages into dir, calling commit with the complete contents
 // when Close is reached.
-func NewStagedWriter(dir string, commit func(io.Reader) error) (*StagedWriter, error) {
+//
+// commit is handed the staging file itself rather than a plain reader, because
+// a backend that must state a length or re-read after a retry can ask it, and
+// one that only wants the bytes can use it as the io.Reader it also is.
+func NewStagedWriter(dir string, commit func(*StagingFile) error) (*StagedWriter, error) {
 	file, err := NewStagingFile(dir, "upload-*")
 	if err != nil {
 		return nil, err

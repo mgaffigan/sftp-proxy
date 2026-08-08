@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -355,5 +357,235 @@ func TestConfigValidateRejectsAllowedMethodsOnALocalEntry(t *testing.T) {
 	cfg.Users[0].RootFS.Children[0].AllowedMethods = []string{"POST"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate() accepted allowedMethods on a local entry")
+	}
+}
+
+func s3User(backend string, access *S3Access, s3Backend *S3Backend) Config {
+	return Config{
+		HostKeyFile:      "host_key",
+		Port:             2222,
+		UploadStagingDir: "staging",
+		S3Backend:        s3Backend,
+		Users: []User{{
+			Username:     "acme",
+			PasswordHash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+			RootFS:       RootFS{Children: []Entry{{Directory: "Archive", Backend: backend, S3: access}}},
+		}},
+	}
+}
+
+func configuredBucket(name string) *S3Backend {
+	return &S3Backend{Buckets: []S3Bucket{{
+		Bucket:   name,
+		S3Access: S3Access{Region: "us-east-1", AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI"},
+	}}}
+}
+
+func statedAccess() *S3Access {
+	return &S3Access{Region: "us-east-1", AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI"}
+}
+
+func TestS3LocationAcceptsOnlyABucketAndAKey(t *testing.T) {
+	for rawURL, want := range map[string][2]string{
+		"s3://acme-archive":                 {"acme-archive", ""},
+		"s3://acme-archive/":                {"acme-archive", ""},
+		"s3://acme-archive/2026":            {"acme-archive", "2026"},
+		"s3://acme-archive/2026/q1":         {"acme-archive", "2026/q1"},
+		"s3://acme-archive/an%20odd%20name": {"acme-archive", "an odd name"},
+	} {
+		bucket, key, ok := S3Location(rawURL)
+		if !ok || bucket != want[0] || key != want[1] {
+			t.Errorf("S3Location(%q) = (%q, %q, %v), want (%q, %q, true)", rawURL, bucket, key, ok, want[0], want[1])
+		}
+	}
+
+	for _, rawURL := range []string{
+		"https://files.example.test/d",
+		"s3://acme-archive/2026?renameTo=%2Fx",
+		"s3://acme-archive/2026#fragment",
+		"s3://user@acme-archive/2026",
+		"s3://acme-archive/2026/../secret",
+		"s3://acme-archive/2026/./here",
+		"s3://ACME/2026",
+		"s3://ab/2026",
+		"s3://192.168.0.1/2026",
+		"s3://-acme/2026",
+		"s3://acme-/2026",
+		"s3://acme..archive/2026",
+		"s3:relative/path",
+		"s3://",
+	} {
+		if bucket, key, ok := S3Location(rawURL); ok {
+			t.Errorf("S3Location(%q) = (%q, %q), want it refused", rawURL, bucket, key)
+		}
+	}
+}
+
+func TestConfigValidateAcceptsAConfiguredBucket(t *testing.T) {
+	cfg := s3User("s3://acme-archive/2026", nil, configuredBucket("acme-archive"))
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+// A bucket table is not the only authority: an entry stating its own
+// credentials names a bucket the deployment never heard of, which is what lets
+// one proxy serve tenants it cannot enumerate.
+func TestConfigValidateAcceptsAnEntryStatingItsOwnCredentials(t *testing.T) {
+	cfg := s3User("s3://tenant-42-archive/2026", statedAccess(), &S3Backend{})
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestConfigValidateRejectsAnUnreachableBucket(t *testing.T) {
+	cfg := s3User("s3://other-bucket/2026", nil, configuredBucket("acme-archive"))
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted a bucket with neither configured nor stated credentials")
+	}
+}
+
+// The s3 scheme is withheld by leaving s3Backend out, as the file scheme is by
+// leaving fileBackend out.
+func TestConfigValidateRejectsAnS3URLWithoutTheBackend(t *testing.T) {
+	cfg := s3User("s3://acme-archive/2026", statedAccess(), nil)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted an s3 backend URL with no s3Backend")
+	}
+}
+
+func TestConfigValidateRejectsCredentialsWithoutAnS3Backend(t *testing.T) {
+	cfg := s3User("https://files.example.test/archive", statedAccess(), &S3Backend{})
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted s3 credentials on an HTTP entry")
+	}
+}
+
+func TestConfigValidateRejectsIncompleteStatedCredentials(t *testing.T) {
+	access := statedAccess()
+	access.SecretAccessKey = ""
+	cfg := s3User("s3://acme-archive/2026", access, &S3Backend{})
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted an access key without its secret")
+	}
+
+	access = statedAccess()
+	access.Region = ""
+	cfg = s3User("s3://acme-archive/2026", access, &S3Backend{})
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted stated credentials with no region")
+	}
+}
+
+func TestConfigValidateRejectsAllowedMethodsOnAnS3Entry(t *testing.T) {
+	cfg := s3User("s3://acme-archive/2026", nil, configuredBucket("acme-archive"))
+	cfg.Users[0].RootFS.Children[0].AllowedMethods = []string{"GET"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted allowedMethods on an s3 entry")
+	}
+}
+
+// Ambient credentials are the proxy's own identity. Only the configuration file
+// can ask for them, and S3Access — all a backend may send — cannot express it.
+func TestS3BucketValidateGovernsAmbientCredentials(t *testing.T) {
+	ambient := S3Backend{Buckets: []S3Bucket{{Bucket: "acme-archive", UseDefaultCredentials: true,
+		S3Access: S3Access{Region: "us-east-1"}}}}
+	if err := ambient.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	both := S3Backend{Buckets: []S3Bucket{{Bucket: "acme-archive", UseDefaultCredentials: true,
+		S3Access: S3Access{Region: "us-east-1", AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI"}}}}
+	if err := both.Validate(); err == nil {
+		t.Fatal("Validate() accepted an ambient bucket that also states a key")
+	}
+
+	duplicate := S3Backend{Buckets: []S3Bucket{
+		{Bucket: "acme-archive", S3Access: *statedAccess()},
+		{Bucket: "acme-archive", S3Access: *statedAccess()},
+	}}
+	if err := duplicate.Validate(); err == nil {
+		t.Fatal("Validate() accepted the same bucket twice")
+	}
+}
+
+func TestS3BucketValidateChecksTheEndpoint(t *testing.T) {
+	for _, endpoint := range []string{"ftp://minio:9000", "minio:9000", "https://user:pass@minio:9000", "https://minio:9000?x=1"} {
+		bucket := S3Bucket{Bucket: "acme-archive", S3Access: *statedAccess()}
+		bucket.Endpoint = endpoint
+		if err := bucket.Validate(); err == nil {
+			t.Errorf("Validate() accepted endpoint %q", endpoint)
+		}
+	}
+	bucket := S3Bucket{Bucket: "acme-archive", S3Access: *statedAccess()}
+	bucket.Endpoint = "http://minio:9000"
+	if err := bucket.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+// A fixed endpoint is addressed path-style unless it says otherwise; AWS, which
+// has no endpoint stated, is not.
+func TestUsePathStyleFollowsTheEndpoint(t *testing.T) {
+	if (S3Access{}).UsePathStyle() {
+		t.Error("UsePathStyle() = true for AWS, want false")
+	}
+	if !(S3Access{Endpoint: "http://minio:9000"}).UsePathStyle() {
+		t.Error("UsePathStyle() = false for a stated endpoint, want true")
+	}
+	virtual := false
+	if (S3Access{Endpoint: "http://minio:9000", PathStyle: &virtual}).UsePathStyle() {
+		t.Error("UsePathStyle() = true, want the stated false")
+	}
+}
+
+// Nothing logs an access today. This is so that a line added later cannot.
+func TestS3AccessLogsNoSecret(t *testing.T) {
+	logged := statedAccess().LogValue().String()
+	for _, secret := range []string{"AKIAEXAMPLE", "wJalrXUtnFEMI"} {
+		if strings.Contains(logged, secret) {
+			t.Errorf("LogValue() = %q, which names %q", logged, secret)
+		}
+	}
+}
+
+// A backend directory listing uses the entry shape, decoded with unknown fields
+// refused. This is what an HTTP backend sends to hand over a tenant's bucket.
+func TestAnEntryDecodesStatedCredentials(t *testing.T) {
+	listing := `{"children":[{"directory":"Archive","backend":"s3://tenant-42-archive/2026",
+		"permissions":365,"s3":{"region":"us-east-1","endpoint":"http://minio:9000",
+		"accessKeyId":"AKIAEXAMPLE","secretAccessKey":"wJalrXUtnFEMI","sessionToken":"IQoJ"}}]}`
+
+	var decoded struct {
+		Children []Entry `json:"children"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(listing))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if err := ValidateEntries(decoded.Children); err != nil {
+		t.Fatalf("ValidateEntries() error = %v", err)
+	}
+	access := decoded.Children[0].S3
+	if access == nil || access.AccessKeyID != "AKIAEXAMPLE" || access.SessionToken != "IQoJ" {
+		t.Fatalf("s3 = %+v, want the stated credentials", access)
+	}
+	if !access.UsePathStyle() {
+		t.Error("UsePathStyle() = false for a stated endpoint, want true")
+	}
+}
+
+// A configured bucket is one flat object, so the table stays readable.
+func TestAnS3BucketDecodesAsOneObject(t *testing.T) {
+	var bucket S3Bucket
+	decoder := json.NewDecoder(strings.NewReader(
+		`{"bucket":"acme-archive","region":"us-east-1","useDefaultCredentials":true}`))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&bucket); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if bucket.Bucket != "acme-archive" || bucket.Region != "us-east-1" || !bucket.UseDefaultCredentials {
+		t.Fatalf("decoded %+v, want the stated bucket", bucket)
 	}
 }

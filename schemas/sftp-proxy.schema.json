@@ -43,6 +43,7 @@
     },
     "authBackend": { "$ref": "#/$defs/authBackend" },
     "fileBackend": { "$ref": "#/$defs/fileBackend" },
+    "s3Backend": { "$ref": "#/$defs/s3Backend" },
     "users": {
       "type": "array",
       "items": { "$ref": "#/$defs/user" }
@@ -88,6 +89,79 @@
           "description": "Absolute, cleaned directories that may be served. Nothing outside them is reachable, and no prefix may contain another. Each must exist at startup."
         }
       }
+    },
+    "s3Backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Consent to serve S3 objects. Without this property no s3:// backend URL can be reached, whether it is configured or returned by a backend listing. Its buckets may be left out entirely by a deployment whose entries always state their own credentials.",
+      "properties": {
+        "buckets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/s3Bucket" },
+          "description": "Buckets this deployment holds credentials for. A bucket absent from this list is reachable only through an entry that states its own."
+        }
+      }
+    },
+    "s3Bucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bucket", "region"],
+      "oneOf": [
+        { "required": ["accessKeyId", "secretAccessKey"] },
+        { "required": ["useDefaultCredentials"] }
+      ],
+      "properties": {
+        "bucket": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([a-z0-9]|[.-][a-z0-9])*$",
+          "description": "Bucket name, which is also the host of the s3:// URLs this entry serves."
+        },
+        "region": { "$ref": "#/$defs/s3Region" },
+        "endpoint": { "$ref": "#/$defs/s3Endpoint" },
+        "pathStyle": { "$ref": "#/$defs/s3PathStyle" },
+        "accessKeyId": { "type": "string", "minLength": 1 },
+        "secretAccessKey": { "type": "string", "minLength": 1 },
+        "sessionToken": { "type": "string", "minLength": 1 },
+        "useDefaultCredentials": {
+          "type": "boolean",
+          "description": "Sign with the proxy's own ambient identity: environment, shared credentials file, web identity token, or instance metadata. Only a configuration file may ask for this; an entry cannot, so no backend can direct the proxy to spend credentials it holds for itself. It is resolved at startup, so a missing identity fails to start."
+        }
+      }
+    },
+    "s3Access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["region", "accessKeyId", "secretAccessKey"],
+      "description": "Credentials reaching the bucket this entry's s3:// URL names, inherited by everything found beneath it. Stating them is how a directory names a bucket the deployment was never configured for, which is what lets one proxy serve tenants it cannot enumerate. Omit this property to use the s3Backend.buckets entry for the bucket instead.",
+      "properties": {
+        "region": { "$ref": "#/$defs/s3Region" },
+        "endpoint": { "$ref": "#/$defs/s3Endpoint" },
+        "pathStyle": { "$ref": "#/$defs/s3PathStyle" },
+        "accessKeyId": { "type": "string", "minLength": 1 },
+        "secretAccessKey": { "type": "string", "minLength": 1 },
+        "sessionToken": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Session token for temporary credentials, such as those an authentication backend mints per user."
+        }
+      }
+    },
+    "s3Region": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Region requests are signed for. S3-compatible services that have no regions of their own generally accept us-east-1."
+    },
+    "s3Endpoint": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://",
+      "description": "Base URL of an S3-compatible service. Omit it for AWS. HTTP is permitted, since a service mesh may present the object store as plain HTTP on the pod's own network."
+    },
+    "s3PathStyle": {
+      "type": "boolean",
+      "description": "Address the bucket in the URL path rather than in the hostname. Defaults to true when an endpoint is stated and false otherwise, which is what AWS and most compatibles respectively expect."
     },
     "user": {
       "type": "object",
@@ -138,12 +212,17 @@
         {
           "if": { "required": ["allowedMethods"] },
           "then": { "required": ["backend"] }
+        },
+        {
+          "if": { "required": ["s3"] },
+          "then": { "required": ["backend"] }
         }
       ],
       "properties": {
         "backend": { "$ref": "#/$defs/backend" },
         "allowedMethods": { "$ref": "#/$defs/allowedMethods" },
         "permissions": { "$ref": "#/$defs/permissions" },
+        "s3": { "$ref": "#/$defs/s3Access" },
         "maxUploadSize": {
           "type": "integer",
           "minimum": 0,
@@ -184,6 +263,10 @@
         {
           "if": { "required": ["allowedMethods"] },
           "then": { "required": ["backend"] }
+        },
+        {
+          "if": { "required": ["s3"] },
+          "then": { "required": ["backend"] }
         }
       ],
       "properties": {
@@ -198,6 +281,7 @@
           "description": "Optional RFC 3339 modification time presented to SFTP clients."
         },
         "permissions": { "$ref": "#/$defs/permissions" },
+        "s3": { "$ref": "#/$defs/s3Access" },
         "children": {
           "type": "array",
           "items": { "$ref": "#/$defs/entry" }
@@ -217,19 +301,19 @@
     "backend": {
       "type": "string",
       "format": "uri",
-      "description": "Where this node is served from: an http:// or https:// base URL, or a file:// URL naming an absolute local path beneath a fileBackend.allowedPrefixes entry."
+      "description": "Where this node is served from: an http:// or https:// base URL, a file:// URL naming an absolute local path beneath a fileBackend.allowedPrefixes entry, or an s3:// URL whose host is a bucket and whose path is an object key."
     },
     "permissions": {
       "type": "integer",
       "minimum": 0,
       "maximum": 511,
-      "description": "POSIX permission bits presented to SFTP clients. On a file:// node they are also enforced, as a mask over the permissions the filesystem itself reports: a read bit permits reading and listing, a write bit permits every change, and the mask is inherited by everything beneath the node. A mask can only take permission away."
+      "description": "POSIX permission bits presented to SFTP clients. On a file:// or s3:// node they are also enforced, as a mask: a read bit permits reading and listing, a write bit permits every change, and the mask is inherited by everything beneath the node. A local file is narrowed by the permissions the filesystem itself reports as well; an object store has none of its own to narrow. A mask can only take permission away."
     },
     "allowedMethods": {
       "type": "array",
       "uniqueItems": true,
       "items": { "enum": ["GET", "POST", "DELETE"] },
-      "description": "HTTP methods the proxy may send to this node's backend. Applies to that node alone and is never inherited by or from another. Requires an http:// or https:// backend, since it constrains requests to one; on a file:// node use permissions instead. An omitted value allows all supported methods."
+      "description": "HTTP methods the proxy may send to this node's backend. Applies to that node alone and is never inherited by or from another. Requires an http:// or https:// backend, since it constrains requests to one; on a file:// or s3:// node use permissions instead. An omitted value allows all supported methods."
     }
   }
 }

@@ -5,9 +5,9 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SCENARIO=${1:-all}
 
 case "$SCENARIO" in
-  trivial|full) SCENARIOS=$SCENARIO ;;
-  all) SCENARIOS="trivial full" ;;
-  *) echo "usage: $0 [trivial|full|all]" >&2; exit 2 ;;
+  trivial|full|s3) SCENARIOS=$SCENARIO ;;
+  all) SCENARIOS="trivial full s3" ;;
+  *) echo "usage: $0 [trivial|full|s3|all]" >&2; exit 2 ;;
 esac
 
 for scenario in $SCENARIOS; do

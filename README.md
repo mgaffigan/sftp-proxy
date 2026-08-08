@@ -1,8 +1,8 @@
 # SFTP Proxy
 
-SFTP Proxy presents files from an HTTP backend, or from directories on the host,
-to standard SFTP and SCP clients. Start with a configuration and an SSH host key,
-then point a client at port `2222`.
+SFTP Proxy presents files from an HTTP backend, from an S3-compatible object
+store, or from directories on the host, to standard SFTP and SCP clients. Start
+with a configuration and an SSH host key, then point a client at port `2222`.
 
 Create a host key and follow one of the guides below to create `config.json`:
 
@@ -40,6 +40,8 @@ default `sftpproxy` user.
 	users directly and forward a drop-only `Inbound` directory to an upload URL.
 - [Local files](docs/local-files.md): serve directories that already exist on
 	the host, with no HTTP backend involved.
+- [S3 buckets](docs/s3-backend.md): serve objects from AWS S3 or an
+	S3-compatible store, with credentials configured or supplied per user.
 - [Trivial backend](docs/trivial-backend.md): write a small HTTP backend that
 	accepts uploads and offers pending downloads.
 - [Advanced backend support](docs/advanced-backend.md): add live directory

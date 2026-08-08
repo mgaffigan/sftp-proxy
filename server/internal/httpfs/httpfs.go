@@ -89,7 +89,7 @@ func (b *Backend) Create(ctx context.Context, node vfs.Node) (vfs.WriterAtCloser
 	if !permits(node, http.MethodPost) {
 		return nil, vfs.ErrPermission
 	}
-	return vfs.NewStagedWriter(b.stagingDir, func(contents io.Reader) error {
+	return vfs.NewStagedWriter(b.stagingDir, func(contents *vfs.StagingFile) error {
 		return b.mutate(ctx, http.MethodPost, node.Backend, uploadContentType, contents)
 	})
 }

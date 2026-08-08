@@ -413,3 +413,49 @@ func TestAnInterruptedTransferDiscardsTheUpload(t *testing.T) {
 		t.Fatalf("%s contains %d entries, want the upload discarded", root, len(entries))
 	}
 }
+
+// No filesystem here can append: a file is staged from empty and stored whole,
+// so writes meant to follow existing content would be all the content there
+// was. The open is refused before anything is created, rather than answered
+// with a truncated file the client was told it had extended.
+func TestAppendIsRefusedBeforeAnythingIsCreated(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "log.txt"), []byte("first line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	local, err := localfs.New([]string{root})
+	if err != nil {
+		t.Fatalf("localfs.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = local.Close() })
+
+	filesystem := vfs.New(config.RootFS{
+		Backend: (&url.URL{Scheme: config.FileScheme, Path: root}).String(),
+	}, vfs.Backends{config.FileScheme: local})
+	adapter := newHandlerFactory(filesystem, 0).handlers(context.Background()).FilePut.(*sftpFS)
+
+	appending := sftp.NewRequest("Put", "/log.txt")
+	appending.Flags = sshFxfAppendForTest
+	if _, err := adapter.Filewrite(appending); !errors.Is(err, sftp.ErrSSHFxOpUnsupported) {
+		t.Fatalf("Filewrite() with append error = %v, want %v", err, sftp.ErrSSHFxOpUnsupported)
+	}
+	// The refusal must leave the file it would have replaced exactly as it was.
+	contents, err := os.ReadFile(filepath.Join(root, "log.txt"))
+	if err != nil || string(contents) != "first line\n" {
+		t.Fatalf("log.txt = (%q, %v), want it untouched", contents, err)
+	}
+
+	// A plain write is still accepted, so the guard reads the flag rather than
+	// refusing every upload.
+	writer, err := adapter.Filewrite(sftp.NewRequest("Put", "/plain.txt"))
+	if err != nil {
+		t.Fatalf("Filewrite() without append error = %v", err)
+	}
+	if err := writer.(io.Closer).Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+// SSH_FXF_APPEND from draft-ietf-secsh-filexfer-02 section 6.3, which pkg/sftp
+// keeps to itself.
+const sshFxfAppendForTest = 0x00000004

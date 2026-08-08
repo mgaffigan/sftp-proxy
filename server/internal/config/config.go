@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -42,6 +44,7 @@ type Config struct {
 	LoginGraceMs     *Millis      `json:"loginGraceMs,omitempty"`
 	AuthBackend      *AuthBackend `json:"authBackend,omitempty"`
 	FileBackend      *FileBackend `json:"fileBackend,omitempty"`
+	S3Backend        *S3Backend   `json:"s3Backend,omitempty"`
 	Users            []User       `json:"users,omitempty"`
 }
 
@@ -56,6 +59,78 @@ type AuthBackend struct {
 // however a configuration or a backend listing names it.
 type FileBackend struct {
 	AllowedPrefixes []string `json:"allowedPrefixes"`
+}
+
+// S3Backend is a deployment's consent to serve S3 objects. Its absence withholds
+// the s3 scheme entirely, as leaving fileBackend out withholds file.
+//
+// Its buckets are the credentials a deployment holds itself, for the buckets it
+// knows about when it starts. A deployment serving tenants it cannot enumerate
+// leaves the list empty and lets each entry carry its own credentials instead.
+type S3Backend struct {
+	Buckets []S3Bucket `json:"buckets,omitempty"`
+}
+
+// S3Access is how one bucket is reached. An entry may carry it inline, which is
+// what lets a directory name a bucket this deployment has never heard of: the
+// backend that returned the entry already holds those credentials, so stating
+// them says nothing it did not already know.
+type S3Access struct {
+	Region          string `json:"region,omitempty"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	PathStyle       *bool  `json:"pathStyle,omitempty"`
+	AccessKeyID     string `json:"accessKeyId,omitempty"`
+	SecretAccessKey string `json:"secretAccessKey,omitempty"`
+	SessionToken    string `json:"sessionToken,omitempty"`
+}
+
+// S3Bucket names a bucket in the configuration file's own table, and is the one
+// place the proxy's ambient identity can be asked for. S3Access, which is what a
+// backend may send, has no such field: a directory listing therefore cannot ask
+// the proxy to spend credentials of its own.
+type S3Bucket struct {
+	S3Access
+	Bucket                string `json:"bucket"`
+	UseDefaultCredentials bool   `json:"useDefaultCredentials,omitempty"`
+}
+
+// LogValue keeps the secret out of anything that logs an access. Nothing in this
+// proxy logs one today; this is so that adding such a line cannot spill a key.
+func (a S3Access) LogValue() slog.Value {
+	credentials := "none"
+	if a.AccessKeyID != "" {
+		credentials = "[redacted]"
+	}
+	return slog.GroupValue(
+		slog.String("region", a.Region),
+		slog.String("endpoint", a.Endpoint),
+		slog.String("credentials", credentials),
+	)
+}
+
+// UsePathStyle reports whether requests address the bucket in the URL path
+// rather than in the hostname. AWS uses virtual-host addressing; most anything
+// else running at a fixed endpoint does not, so an endpoint that states nothing
+// gets path style.
+func (a S3Access) UsePathStyle() bool {
+	if a.PathStyle != nil {
+		return *a.PathStyle
+	}
+	return a.Endpoint != ""
+}
+
+// Bucket finds a configured bucket's access. A deployment that configured none
+// is not an error here: the entry that named the bucket may carry its own.
+func (s *S3Backend) Bucket(name string) (S3Bucket, bool) {
+	if s == nil {
+		return S3Bucket{}, false
+	}
+	for _, bucket := range s.Buckets {
+		if bucket.Bucket == name {
+			return bucket, true
+		}
+	}
+	return S3Bucket{}, false
 }
 
 type User struct {
@@ -109,11 +184,12 @@ func (u User) UploadConcurrencyLimit() int {
 }
 
 type RootFS struct {
-	Backend        string   `json:"backend,omitempty"`
-	AllowedMethods []string `json:"allowedMethods,omitempty"`
-	Permissions    *uint32  `json:"permissions,omitempty"`
-	Children       []Entry  `json:"children,omitempty"`
-	MaxUploadSize  int64    `json:"maxUploadSize,omitempty"`
+	Backend        string    `json:"backend,omitempty"`
+	AllowedMethods []string  `json:"allowedMethods,omitempty"`
+	Permissions    *uint32   `json:"permissions,omitempty"`
+	S3             *S3Access `json:"s3,omitempty"`
+	Children       []Entry   `json:"children,omitempty"`
+	MaxUploadSize  int64     `json:"maxUploadSize,omitempty"`
 }
 
 // Entry views the root as the directory node it is, so that resolution,
@@ -124,6 +200,7 @@ func (r RootFS) Entry() Entry {
 		Backend:        r.Backend,
 		AllowedMethods: r.AllowedMethods,
 		Permissions:    r.Permissions,
+		S3:             r.S3,
 		Children:       r.Children,
 		MaxUploadSize:  r.MaxUploadSize,
 	}
@@ -137,6 +214,7 @@ type Entry struct {
 	Size           int64      `json:"size,omitempty"`
 	Mtime          *time.Time `json:"mtime,omitempty"`
 	Permissions    *uint32    `json:"permissions,omitempty"`
+	S3             *S3Access  `json:"s3,omitempty"`
 	Children       []Entry    `json:"children,omitempty"`
 	MaxUploadSize  int64      `json:"maxUploadSize,omitempty"`
 }
@@ -195,6 +273,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("fileBackend: %w", err)
 		}
 	}
+	if c.S3Backend != nil {
+		if err := c.S3Backend.Validate(); err != nil {
+			return fmt.Errorf("s3Backend: %w", err)
+		}
+	}
 	if len(c.Users) == 0 && c.AuthBackend == nil {
 		return errors.New("configure at least one user or authBackend")
 	}
@@ -205,6 +288,9 @@ func (c Config) Validate() error {
 			return fmt.Errorf("users[%d]: %w", index, err)
 		}
 		if err := c.validateLocalPaths(user.RootFS); err != nil {
+			return fmt.Errorf("users[%d]: %w", index, err)
+		}
+		if err := c.validateS3Buckets(user.RootFS); err != nil {
 			return fmt.Errorf("users[%d]: %w", index, err)
 		}
 		if _, exists := seenUsers[user.Username]; exists {
@@ -258,9 +344,26 @@ func Relative(prefix, path string) (string, bool) {
 // statically configured tree can be checked here — one a user's authentication
 // backend supplies arrives too late — so the backend enforces this again itself.
 func (c Config) validateLocalPaths(root RootFS) error {
+	return walkEntries(root, func(entry Entry) error {
+		return c.validateLocalBackend(entry.Backend)
+	})
+}
+
+// validateS3Buckets refuses at startup an S3 bucket this deployment can neither
+// reach with credentials of its own nor was told how to reach. As above, only a
+// statically configured tree can be checked here, so the backend checks again.
+func (c Config) validateS3Buckets(root RootFS) error {
+	return walkEntries(root, func(entry Entry) error {
+		return c.validateS3Backend(entry.Backend, entry.S3)
+	})
+}
+
+// walkEntries visits the root and every entry beneath it, naming in any error
+// where the offending entry was found.
+func walkEntries(root RootFS, visit func(entry Entry) error) error {
 	var walk func(entry Entry) error
 	walk = func(entry Entry) error {
-		if err := c.validateLocalBackend(entry.Backend); err != nil {
+		if err := visit(entry); err != nil {
 			return fmt.Errorf("%s: %w", entry.Name(), err)
 		}
 		for _, child := range entry.Children {
@@ -270,7 +373,7 @@ func (c Config) validateLocalPaths(root RootFS) error {
 		}
 		return nil
 	}
-	if err := c.validateLocalBackend(root.Backend); err != nil {
+	if err := visit(root.Entry()); err != nil {
 		return fmt.Errorf("rootfs: %w", err)
 	}
 	for _, child := range root.Children {
@@ -295,6 +398,87 @@ func (c Config) validateLocalBackend(rawURL string) error {
 		}
 	}
 	return fmt.Errorf("%q lies outside every fileBackend.allowedPrefixes entry", path)
+}
+
+func (c Config) validateS3Backend(rawURL string, access *S3Access) error {
+	bucket, _, ok := S3Location(rawURL)
+	if !ok {
+		return nil
+	}
+	if c.S3Backend == nil {
+		return errors.New("an s3 backend URL requires s3Backend")
+	}
+	// An entry stating its own credentials names a bucket this deployment need
+	// never have heard of, which is the whole point of stating them.
+	if access != nil {
+		return nil
+	}
+	if _, found := c.S3Backend.Bucket(bucket); !found {
+		return fmt.Errorf("bucket %q is not in s3Backend.buckets and the entry states no credentials", bucket)
+	}
+	return nil
+}
+
+func (s S3Backend) Validate() error {
+	for index, bucket := range s.Buckets {
+		if err := bucket.Validate(); err != nil {
+			return fmt.Errorf("buckets[%d]: %w", index, err)
+		}
+		for _, other := range s.Buckets[:index] {
+			if other.Bucket == bucket.Bucket {
+				return fmt.Errorf("buckets[%d]: duplicate bucket %q", index, bucket.Bucket)
+			}
+		}
+	}
+	return nil
+}
+
+func (b S3Bucket) Validate() error {
+	if !ValidBucketName(b.Bucket) {
+		return fmt.Errorf("invalid bucket name %q", b.Bucket)
+	}
+	// The two ways to hold credentials are alternatives, not layers: a bucket
+	// asking for both would leave which one signs a request unanswered.
+	if b.UseDefaultCredentials {
+		if b.AccessKeyID != "" || b.SecretAccessKey != "" || b.SessionToken != "" {
+			return errors.New("useDefaultCredentials cannot be combined with an access key")
+		}
+		return b.validateReachable()
+	}
+	return b.S3Access.Validate()
+}
+
+// Validate checks an access stated inline on an entry, where credentials are
+// required: an entry that has none says nothing the bucket table did not
+// already say, and omitting it says exactly that.
+func (a S3Access) Validate() error {
+	if err := a.validateReachable(); err != nil {
+		return err
+	}
+	if a.AccessKeyID == "" || a.SecretAccessKey == "" {
+		return errors.New("accessKeyId and secretAccessKey are both required")
+	}
+	return nil
+}
+
+// validateReachable checks what says where a bucket is, leaving what signs for
+// it to the caller: a configuration file may name the proxy's own identity
+// instead of a key, and an entry may not.
+func (a S3Access) validateReachable() error {
+	if a.Region == "" {
+		return errors.New("region is required")
+	}
+	if a.Endpoint == "" {
+		return nil
+	}
+	parsed, err := url.Parse(a.Endpoint)
+	if err != nil || parsed.Host == "" || parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("endpoint must be an http or https URL, got %q", a.Endpoint)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("endpoint must not contain credentials, a query, or a fragment")
+	}
+	return nil
 }
 
 func (a AuthBackend) Validate() error {
@@ -349,6 +533,9 @@ func (r RootFS) Validate() error {
 		}
 	}
 	if err := validateMethods(r.AllowedMethods, r.Backend); err != nil {
+		return err
+	}
+	if err := validateAccess(r.S3, r.Backend); err != nil {
 		return err
 	}
 	return validateChildren(r.Children, "rootfs")
@@ -407,6 +594,9 @@ func (e Entry) Validate() error {
 	if err := validateMethods(e.AllowedMethods, e.Backend); err != nil {
 		return err
 	}
+	if err := validateAccess(e.S3, e.Backend); err != nil {
+		return err
+	}
 	return validateChildren(e.Children, e.Name())
 }
 
@@ -460,6 +650,9 @@ func validateMethods(methods []string, backend string) error {
 	if _, local := LocalPath(backend); local {
 		return errors.New("allowedMethods does not apply to a file backend; use permissions")
 	}
+	if _, _, isS3 := S3Location(backend); isS3 {
+		return errors.New("allowedMethods does not apply to an s3 backend; use permissions")
+	}
 	for index, method := range methods {
 		if !slices.Contains(supportedMethods, method) {
 			return fmt.Errorf("unsupported allowed method %q", method)
@@ -484,6 +677,23 @@ func ValidName(name string) bool {
 // fileBackend out of its configuration.
 const FileScheme = "file"
 
+// S3Scheme names the backend serving S3 objects, withheld in the same way by a
+// configuration that leaves s3Backend out.
+const S3Scheme = "s3"
+
+// validateAccess checks credentials stated on an entry. They constrain nothing
+// without an s3:// backend to reach, so an entry carrying them anywhere else is
+// rejected rather than quietly ignored — as allowedMethods is.
+func validateAccess(access *S3Access, backend string) error {
+	if access == nil {
+		return nil
+	}
+	if _, _, ok := S3Location(backend); !ok {
+		return errors.New("s3 credentials require an s3 backend URL")
+	}
+	return access.Validate()
+}
+
 func validateBackendURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme == "" {
@@ -503,9 +713,68 @@ func validateBackendURL(rawURL string) error {
 			return fmt.Errorf("file backend URL must name a local absolute path and nothing else, got %q", rawURL)
 		}
 		return nil
+	case S3Scheme:
+		if _, _, ok := S3Location(rawURL); !ok {
+			return fmt.Errorf("s3 backend URL must name a bucket and an object key and nothing else, got %q", rawURL)
+		}
+		return nil
 	default:
-		return fmt.Errorf("backend URL must use http, https, or file, got %q", parsed.Scheme)
+		return fmt.Errorf("backend URL must use http, https, file, or s3, got %q", parsed.Scheme)
 	}
+}
+
+// S3Location reports the bucket and object key an s3 backend URL names, and
+// whether the URL is one at all. It is the single definition of what s3:// means
+// to this proxy: a bucket as the host and an object key as the path, with
+// nothing else attached.
+//
+// The key is returned without a leading slash, so a bucket root is the empty
+// key. Every segment is an ordinary name, which is what keeps a key built here
+// from climbing anywhere: there is no . or .. for it to climb with.
+func S3Location(rawURL string) (bucket, key string, ok bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != S3Scheme {
+		return "", "", false
+	}
+	if parsed.Opaque != "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawQuery != "" || parsed.ForceQuery {
+		return "", "", false
+	}
+	if !ValidBucketName(parsed.Host) {
+		return "", "", false
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(segments) == 1 && segments[0] == "" {
+		return parsed.Host, "", true
+	}
+	for _, segment := range segments {
+		if !ValidName(segment) {
+			return "", "", false
+		}
+	}
+	return parsed.Host, strings.Join(segments, "/"), true
+}
+
+// ValidBucketName reports whether name is a bucket name every S3 implementation
+// accepts: the common subset, rather than the widest any one of them allows.
+// A name outside it is refused here rather than turned into a request that
+// would be signed for one host and answered by another.
+func ValidBucketName(name string) bool {
+	if len(name) < 3 || len(name) > 63 || net.ParseIP(name) != nil {
+		return false
+	}
+	for index, character := range []byte(name) {
+		alphanumeric := character >= 'a' && character <= 'z' || character >= '0' && character <= '9'
+		switch {
+		case alphanumeric:
+		case character != '-' && character != '.':
+			return false
+		case index == 0 || index == len(name)-1:
+			return false
+		case name[index-1] == '.' || name[index-1] == '-':
+			return false
+		}
+	}
+	return true
 }
 
 // LocalPath reports the filesystem path a file backend URL names, and whether

@@ -1,0 +1,43 @@
+{
+  "hostKeyFile": "/run/host_key",
+  "port": 2222,
+  "uploadStagingDir": "/staging",
+  "s3Backend": {
+    "buckets": [
+      {
+        "bucket": "acme-archive",
+        "region": "us-east-1",
+        "endpoint": "http://minio:9000",
+        "accessKeyId": "minioadmin",
+        "secretAccessKey": "minioadmin"
+      }
+    ]
+  },
+  "users": [
+    {
+      "username": "acme",
+      "passwordHash": "$2a$12$uBBKp3uZyw3b2fF0UZlfTuUfG8u.39jSolShye/VdJWCZZV6Rp.la",
+      "rootfs": {
+        "children": [
+          {
+            "directory": "Inbound",
+            "backend": "s3://acme-archive/inbound"
+          },
+          {
+            "directory": "Outbound",
+            "backend": "s3://acme-archive/outbound"
+          },
+          {
+            "directory": "ReadOnly",
+            "backend": "s3://acme-archive/outbound",
+            "permissions": 365
+          },
+          {
+            "directory": "Tenant",
+            "backend": "http://backend-s3:8080/tenant"
+          }
+        ]
+      }
+    }
+  ]
+}

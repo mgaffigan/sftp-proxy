@@ -52,7 +52,7 @@ func TestStagingFileIsGoneBeforeItIsEverWritten(t *testing.T) {
 func TestStagedWriterCommitsWhatWasWrittenAndLeavesNothing(t *testing.T) {
 	dir := t.TempDir()
 	var committed string
-	writer, err := NewStagedWriter(dir, func(contents io.Reader) error {
+	writer, err := NewStagedWriter(dir, func(contents *StagingFile) error {
 		data, err := io.ReadAll(contents)
 		committed = string(data)
 		return err
@@ -85,7 +85,7 @@ func TestStagedWriterCommitsWhatWasWrittenAndLeavesNothing(t *testing.T) {
 func TestStagedWriterLeavesNothingWhenTheCommitFails(t *testing.T) {
 	dir := t.TempDir()
 	refused := errors.New("backend refused")
-	writer, err := NewStagedWriter(dir, func(io.Reader) error { return refused })
+	writer, err := NewStagedWriter(dir, func(*StagingFile) error { return refused })
 	if err != nil {
 		t.Fatalf("NewStagedWriter() error = %v", err)
 	}
@@ -103,7 +103,7 @@ func TestStagedWriterLeavesNothingWhenTheCommitFails(t *testing.T) {
 func TestStagedWriterDoesNotCommitAfterWriteFails(t *testing.T) {
 	dir := t.TempDir()
 	committed := false
-	writer, err := NewStagedWriter(dir, func(io.Reader) error {
+	writer, err := NewStagedWriter(dir, func(*StagingFile) error {
 		committed = true
 		return nil
 	})
@@ -131,7 +131,7 @@ func TestStagedWriterDoesNotCommitAfterWriteFails(t *testing.T) {
 func TestStagedWriterCommitsALargeSparseFileWhole(t *testing.T) {
 	dir := t.TempDir()
 	var size int
-	writer, err := NewStagedWriter(dir, func(contents io.Reader) error {
+	writer, err := NewStagedWriter(dir, func(contents *StagingFile) error {
 		data, err := io.ReadAll(contents)
 		size = len(data)
 		return err

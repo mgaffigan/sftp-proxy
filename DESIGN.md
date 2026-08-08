@@ -4,8 +4,8 @@ We're going to create a bulletproof SFTP to HTTP proxy that can serve as a front
 
 The first implementation is Go, using `golang.org/x/crypto/ssh` for SSH and
 `github.com/pkg/sftp` for SFTP. It supports SFTP and SCP over the same virtual
-filesystem, served by an HTTP backend and by a local filesystem backend.
-S3-compatible backends are deferred.
+filesystem, served by an HTTP backend, a local filesystem backend, and an
+S3-compatible object store backend.
 
 The server uses a configured PEM host key and refuses to start if it cannot
 load it. By default it listens on TCP port 2222 on IPv4 and IPv6 wildcard
@@ -150,6 +150,15 @@ Permission, owner, group, and timestamp updates succeed as synthetic no-ops.
 Operations requiring durable link semantics are unsupported until a backend
 contract for them exists.
 
+A rename onto an occupied name is an error rather than a replacement, as SFTP
+says it is. Each backend asks its own store, the only thing that can answer;
+neither can rename and refuse to clobber in one step, so an object arriving at
+the destination in between is still replaced.
+
+Opening a file to append is refused up front, before anything is created. A file
+is staged from empty and stored whole, so appended writes would be all the
+content there was rather than the end of it.
+
 ### Local Filesystem Backend
 
 - **Paths**: Absolute local URLs only (no query, fragment, or remote host).
@@ -158,6 +167,19 @@ contract for them exists.
 - **Permissions**: Masked via 'permissions' prop; inherits down tree.
 - **Files**: Plain files/dirs only. Atomic uploads via temp renames.
 - **Errors**: OS details hidden; generic backend errors, traces logged.
+
+### S3 Backend
+
+**Activation & Addressing**
+The S3 backend is disabled by default; serving `s3://` URLs requires an explicit `s3Backend` configuration. Key paths are strictly literal names with no relative path climbing (`.` or `..`).
+
+**Authentication & Credentials**
+URLs never carry credentials. Authenticating buckets occurs via two paths:
+* **Static Buckets (`s3Backend.buckets`)**: Use explicit credentials or ambient IAM (`useDefaultCredentials`). Ambient identity is disabled by default and resolved at startup; missing credentials cause an immediate startup failure.
+* **Dynamic Entries**: Receive credentials (including short-lived STS tokens) via an `s3` property on the directory entry, which is inherited by all child nodes in the subtree. Dynamic entries cannot request `useDefaultCredentials` to prevent delegating the proxy's ambient identity.
+
+**Directory Model & Permissions**
+The backend exposes a pure virtual prefix tree without placeholder objects or `mkdir` support. Empty directories do not exist; any directory that must exist prior to population must be declared in configuration via its `s3://` prefix. Permission masks are inherited across subtrees, and `allowedMethods` is rejected on S3 nodes.
 
 ### SCP
 

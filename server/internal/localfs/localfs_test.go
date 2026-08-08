@@ -536,3 +536,40 @@ func TestNothingOfTheFilesystemTravelsWithAnError(t *testing.T) {
 		t.Errorf("outside error = %v, want permission denied", outsideRoot)
 	}
 }
+
+// SFTP says a rename onto an existing name is an error rather than a
+// replacement, which os.Rename would happily perform.
+func TestRenameRefusesToOverwriteTheDestination(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "one.txt"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "two.txt"), []byte("destination"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backend, err := New([]string{root})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+
+	node := vfs.Node{File: "one.txt", Backend: fileURL(filepath.Join(root, "one.txt"))}
+	err = backend.Rename(context.Background(), node, "/one.txt", "/two.txt")
+	if !errors.Is(err, vfs.ErrExist) {
+		t.Fatalf("Rename() error = %v, want %v", err, vfs.ErrExist)
+	}
+	for name, want := range map[string]string{"one.txt": "source", "two.txt": "destination"} {
+		contents, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil || string(contents) != want {
+			t.Errorf("%s = (%q, %v), want %q", name, contents, err, want)
+		}
+	}
+
+	// A destination that is free is still renamed onto.
+	if err := backend.Rename(context.Background(), node, "/one.txt", "/three.txt"); err != nil {
+		t.Fatalf("Rename() to a free name error = %v", err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(root, "three.txt")); err != nil || string(contents) != "source" {
+		t.Errorf("three.txt = (%q, %v), want %q", contents, err, "source")
+	}
+}

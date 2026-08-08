@@ -22,6 +22,7 @@ import (
 	"sftp-proxy/internal/config"
 	"sftp-proxy/internal/httpfs"
 	"sftp-proxy/internal/localfs"
+	"sftp-proxy/internal/s3fs"
 	"sftp-proxy/internal/telemetry"
 	"sftp-proxy/internal/vfs"
 )
@@ -31,6 +32,7 @@ type Server struct {
 	signer ssh.Signer
 	auth   *auth.Authenticator
 	local  *localfs.Backend
+	s3     *s3fs.Backend
 	logger *slog.Logger
 }
 
@@ -54,6 +56,11 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	if cfg.FileBackend != nil {
 		if server.local, err = localfs.New(cfg.FileBackend.AllowedPrefixes); err != nil {
 			return nil, fmt.Errorf("open file backend: %w", err)
+		}
+	}
+	if cfg.S3Backend != nil {
+		if server.s3, err = s3fs.New(cfg.S3Backend, cfg.UploadStagingDir); err != nil {
+			return nil, fmt.Errorf("open s3 backend: %w", err)
 		}
 	}
 	if err := os.MkdirAll(cfg.UploadStagingDir, 0700); err != nil {
@@ -247,11 +254,14 @@ func (s *Server) filesystem(session auth.Session) *vfs.FS {
 		"http":  overHTTP,
 		"https": overHTTP,
 	}
-	// The local backend holds the directories a deployment consented to serve,
-	// which belong to the process rather than to one connection: it has no
-	// cookie jar to carry and no per-session state at all.
+	// The local and S3 backends belong to the process rather than to one
+	// connection: neither has a cookie jar to carry, and the credentials that
+	// differ between users travel on the nodes themselves.
 	if s.local != nil {
 		backends[config.FileScheme] = s.local
+	}
+	if s.s3 != nil {
+		backends[config.S3Scheme] = s.s3
 	}
 	return vfs.New(session.User.RootFS, backends)
 }

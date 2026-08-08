@@ -103,6 +103,10 @@ func (s *sftpFS) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (s *sftpFS) Filewrite(request *sftp.Request) (io.WriterAt, error) {
+	// We don't support append (s3 is immutable)
+	if request.Pflags().Append {
+		return nil, sftp.ErrSSHFxOpUnsupported
+	}
 	ctx, finish := s.startOperation(request, "write")
 	release, ok := s.uploads.acquire()
 	if !ok {

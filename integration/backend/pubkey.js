@@ -6,6 +6,11 @@ const app = new Hono();
 const origin = "http://backend-pubkey:8080";
 const seedContents = "public-key outbound seed\n";
 const authorizedKey = readFileSync("/keys/acme.pub", "utf8").trim();
+const sharedSecret = "Bearer integration-test-secret";
+
+function isAuthorizedCaller(context) {
+  return context.req.header("authorization") === sharedSecret;
+}
 
 function authenticatedUser() {
   return {
@@ -24,6 +29,9 @@ function authenticatedUser() {
 }
 
 app.post("/v1/sftp/auth/lookup", async (context) => {
+  if (!isAuthorizedCaller(context)) {
+    return context.body(null, 403);
+  }
   const request = await context.req.json();
   if (request.connection?.username !== "acme") {
     return context.body(null, 403);
@@ -31,9 +39,12 @@ app.post("/v1/sftp/auth/lookup", async (context) => {
   return context.json({ methods: ["publickey"], authorizedKeys: [authorizedKey] });
 });
 
-app.post("/v1/sftp/auth/finalize", async (context) => {
+app.post("/v1/sftp/auth/publickey", async (context) => {
+  if (!isAuthorizedCaller(context)) {
+    return context.body(null, 403);
+  }
   const request = await context.req.json();
-  if (request.connection?.username !== "acme" || request.method !== "publickey") {
+  if (request.connection?.username !== "acme") {
     return context.body(null, 403);
   }
   return context.json(authenticatedUser());

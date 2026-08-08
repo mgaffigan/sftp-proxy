@@ -3,6 +3,7 @@ const http = require("http");
 const files = new Map([["/seed.txt", Buffer.from("seed data\n")]]);
 const directories = new Set(["/"]);
 const origin = "http://backend-full:8080";
+const sharedSecret = "Bearer integration-test-secret";
 
 function readBody(request) {
   return new Promise((resolve, reject) => {
@@ -46,6 +47,10 @@ function renameTarget(value) {
 http.createServer(async (request, response) => {
   const url = new URL(request.url, origin);
   if (url.pathname === "/auth" && request.method === "POST") {
+    if (request.headers["authorization"] !== sharedSecret) {
+      response.writeHead(403).end();
+      return;
+    }
     const credentials = JSON.parse((await readBody(request)).toString("utf8"));
     if (credentials.connection?.username !== "acme" || credentials.password !== "secret") {
       response.writeHead(403).end();

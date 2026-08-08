@@ -20,23 +20,23 @@ call the HTTP authentication backend.
 
 Dynamic authentication is username-first, so a backend need only return the
 policy for the requested user rather than every possible public key. The
-dynamic flow has three phases:
+dynamic flow has two phases:
 
 1. `POST /v1/sftp/auth/lookup` receives the username and client connection
   metadata. It returns allowed authentication methods and, for public-key
   authentication, the public keys authorized for that username.
-2. For password authentication, `POST /v1/sftp/auth/password` receives the
-  username, password, and connection metadata. For public-key authentication,
-  the proxy verifies the SSH signature locally using a key returned by lookup.
-3. `POST /v1/sftp/auth/finalize` receives the username, authenticated method,
-  and connection metadata. It returns the authenticated user configuration and
-  virtual filesystem. The proxy calls finalize only after authentication has
-  succeeded.
+2. **For password authentication,** `POST /v1/sftp/auth/password` receives the
+  username, password, and connection metadata, and returns the authenticated
+  user configuration and virtual filesystem. **For public-key authentication,**
+  the proxy verifies the SSH signature locally using a key returned by lookup,
+  then calls `POST /v1/sftp/auth/publickey` with the username, fingerprint,
+  and connection metadata, which likewise returns the authenticated user.
 
 For a password-only integration, `authBackend.url` may instead name one
-single-step endpoint. The proxy sends the username, password, method, and
-connection metadata in one `POST`; a successful response returns the same user
-configuration as finalize. This mode does not offer public-key authentication.
+single-step endpoint. The proxy sends the username, password, and connection
+metadata in one `POST`; a successful response returns the same user
+configuration as the multi-step `password` endpoint. This mode does not offer
+public-key authentication.
 
 The backend may reject a request with a normal HTTP status code. `401` and
 `403` reject authentication, `404` means the user is unknown, and `5xx` or a
@@ -50,6 +50,9 @@ authentication and filesystem requests only. The proxy adds `X-Forwarded-For`,
 may use HTTP or HTTPS as configured. Redirects follow normal user-agent cookie
 origin rules and must not escape the configured backend origin or path prefix.
 Auth backends can provide headers that are propagated to HTTP and s3.
+Conversely, `authBackend.headers` is a static credential the proxy presents
+to the auth backend itself on every request, since nothing else lets that
+backend tell the proxy apart from any other caller.
 
 ### HTTP Virtual Filesystem Contract
 

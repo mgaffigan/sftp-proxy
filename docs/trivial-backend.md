@@ -11,7 +11,8 @@ Configure the proxy to call one password endpoint:
   "$schema": "./schemas/sftp-proxy.schema.json",
   "hostKeyFile": "/config/host_key",
   "authBackend": {
-    "url": "http://backend.example.test:8080/auth"
+    "url": "http://backend.example.test:8080/auth",
+    "headers": { "authorization": "Bearer trivial-backend-token" }
   }
 }
 ```
@@ -36,6 +37,9 @@ function pendingChildren() {
 }
 
 app.post("/auth", async (context) => {
+  if (context.req.header("authorization") !== "Bearer trivial-backend-token") {
+    return context.body(null, 403);
+  }
   const request = await context.req.json();
   if (request.connection?.username !== "acme" || request.password !== "secret") {
     return context.body(null, 403);

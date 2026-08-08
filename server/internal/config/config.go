@@ -49,9 +49,10 @@ type Config struct {
 }
 
 type AuthBackend struct {
-	BaseURL   string  `json:"baseURL"`
-	URL       string  `json:"url,omitempty"`
-	TimeoutMs *Millis `json:"timeoutMs,omitempty"`
+	BaseURL   string            `json:"baseURL"`
+	URL       string            `json:"url,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	TimeoutMs *Millis           `json:"timeoutMs,omitempty"`
 }
 
 // FileBackend is a deployment's consent to serve local files. Its absence

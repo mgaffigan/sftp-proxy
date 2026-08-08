@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +21,7 @@ import (
 	"sftp-proxy/internal/config"
 )
 
-func TestPasswordAuthenticationFinalizesBackendSession(t *testing.T) {
+func TestPasswordAuthenticationCallsLookupThenPassword(t *testing.T) {
 	var calls []string
 	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		calls = append(calls, request.URL.Path)
@@ -35,12 +36,7 @@ func TestPasswordAuthenticationFinalizesBackendSession(t *testing.T) {
 			if _, err := request.Cookie("session"); err != nil {
 				t.Fatalf("password request did not retain cookie: %v", err)
 			}
-			writer.WriteHeader(http.StatusNoContent)
-		case "/v1/sftp/auth/finalize":
-			if _, err := request.Cookie("session"); err != nil {
-				t.Fatalf("finalize request did not retain cookie: %v", err)
-			}
-			_ = json.NewEncoder(writer).Encode(finalizeResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
+			_ = json.NewEncoder(writer).Encode(authResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
 				Directory: "Inbound",
 				Backend:   "https://files.example.test/inbound",
 			}}}}})
@@ -59,8 +55,120 @@ func TestPasswordAuthenticationFinalizesBackendSession(t *testing.T) {
 	if !found || session.User.Username != "acme" || len(session.User.RootFS.Children) != 1 {
 		t.Fatalf("unexpected session: %#v, found=%v", session, found)
 	}
-	if len(calls) != 3 {
-		t.Fatalf("backend calls = %v, want lookup, password, finalize", calls)
+	if want := []string{"/v1/sftp/auth/lookup", "/v1/sftp/auth/password"}; !slices.Equal(calls, want) {
+		t.Fatalf("backend calls = %v, want %v", calls, want)
+	}
+}
+
+// authBackend.baseURL's public-key path calls lookup then publickey, never
+// finalize, and finalize's old method field disambiguation is gone: publickey
+// is reachable only via its own endpoint now.
+func TestPublicKeyAuthenticationCallsLookupThenPublicKey(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizedKey := string(ssh.MarshalAuthorizedKey(key))
+
+	var calls []string
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls = append(calls, request.URL.Path)
+		switch request.URL.Path {
+		case "/v1/sftp/auth/lookup":
+			_ = json.NewEncoder(writer).Encode(lookupResponse{Methods: []string{"publickey"}, AuthorizedKeys: []string{authorizedKey}})
+		case "/v1/sftp/auth/publickey":
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(body, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if _, hasMethod := raw["method"]; hasMethod {
+				t.Fatalf("publickey request still sends a method field: %s", body)
+			}
+			var received struct {
+				Connection  metadata `json:"connection"`
+				Fingerprint string   `json:"fingerprint"`
+			}
+			if err := json.Unmarshal(body, &received); err != nil {
+				t.Fatal(err)
+			}
+			if received.Connection.Username != "acme" || received.Fingerprint != ssh.FingerprintSHA256(key) {
+				t.Fatalf("unexpected publickey request: %#v", received)
+			}
+			_ = json.NewEncoder(writer).Encode(authResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
+				Directory: "Inbound",
+				Backend:   "https://files.example.test/inbound",
+			}}}}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer backend.Close()
+
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn(t.Context())
+	permissions, err := authConn.PublicKey(testConnection{username: "acme"}, key)
+	if err != nil {
+		t.Fatalf("PublicKey() error = %v", err)
+	}
+	session, found := SessionFrom(permissions)
+	if !found || session.User.Username != "acme" || len(session.User.RootFS.Children) != 1 {
+		t.Fatalf("unexpected session: %#v, found=%v", session, found)
+	}
+	if want := []string{"/v1/sftp/auth/lookup", "/v1/sftp/auth/publickey"}; !slices.Equal(calls, want) {
+		t.Fatalf("backend calls = %v, want %v", calls, want)
+	}
+}
+
+// authBackend.headers lets the proxy authenticate itself to the backend, on
+// every request in both baseURL and single-endpoint mode since both funnel
+// through backendClient.postTo.
+func TestConfiguredHeadersAreSentToTheBackend(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization = %q, want %q", got, "Bearer secret")
+		}
+		_ = json.NewEncoder(writer).Encode(lookupResponse{Methods: []string{"password"}})
+	}))
+	defer backend.Close()
+
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{
+		BaseURL: backend.URL,
+		Headers: map[string]string{"Authorization": "Bearer secret"},
+	}}).NewConn(t.Context())
+	fullBackend, ok := authConn.backend.(*fullAuth)
+	if !ok {
+		t.Fatalf("backend = %T, want *fullAuth", authConn.backend)
+	}
+	if _, err := fullBackend.lookupPolicy(t.Context(), testConnection{username: "acme"}); err != nil {
+		t.Fatalf("lookupPolicy() error = %v", err)
+	}
+}
+
+func TestConfiguredHeadersAreSentToTheSingleEndpoint(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization = %q, want %q", got, "Bearer secret")
+		}
+		_ = json.NewEncoder(writer).Encode(authResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
+			Directory: "Inbound",
+			Backend:   "https://files.example.test/inbound",
+		}}}}})
+	}))
+	defer backend.Close()
+
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{
+		URL:     backend.URL,
+		Headers: map[string]string{"Authorization": "Bearer secret"},
+	}}).NewConn(t.Context())
+	if _, err := authConn.Password(testConnection{username: "acme"}, []byte("secret")); err != nil {
+		t.Fatalf("Password() error = %v", err)
 	}
 }
 
@@ -74,15 +182,14 @@ func TestPasswordAuthenticationWithSingleEndpoint(t *testing.T) {
 		var received struct {
 			Connection metadata `json:"connection"`
 			Password   string   `json:"password"`
-			Method     string   `json:"method"`
 		}
 		if err := json.NewDecoder(httpRequest.Body).Decode(&received); err != nil {
 			t.Fatal(err)
 		}
-		if received.Connection.Username != "acme" || received.Password != "secret" || received.Method != "password" {
+		if received.Connection.Username != "acme" || received.Password != "secret" {
 			t.Fatalf("unexpected auth request: %#v", received)
 		}
-		_ = json.NewEncoder(writer).Encode(finalizeResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
+		_ = json.NewEncoder(writer).Encode(authResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
 			Directory: "Inbound",
 			Backend:   backend.URL + "/upload",
 		}}}}})
@@ -105,7 +212,7 @@ func TestAuthenticationFollowsCrossOriginRedirects(t *testing.T) {
 		if request.Method != http.MethodPost {
 			t.Errorf("redirected method = %s, want POST", request.Method)
 		}
-		_ = json.NewEncoder(writer).Encode(finalizeResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
+		_ = json.NewEncoder(writer).Encode(authResponse{User: config.User{RootFS: config.RootFS{Children: []config.Entry{{
 			Directory: "Inbound",
 			Backend:   elsewhere.URL + "/inbound",
 		}}}}})

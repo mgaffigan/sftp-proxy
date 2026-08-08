@@ -213,6 +213,28 @@ func TestTimeoutDefaultsDistinguishOmittedFromZero(t *testing.T) {
 	}
 }
 
+// authBackend.headers lets the proxy authenticate itself to the backend; it
+// must round-trip through Load like any other configured value.
+func TestLoadReadsAuthBackendHeaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	contents := `{
+  "hostKeyFile": "host_key",
+  "authBackend": {"url": "http://localhost:8080/auth", "headers": {"authorization": "Bearer secret"}}
+}`
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := map[string]string{"authorization": "Bearer secret"}
+	if got := config.AuthBackend.Headers; !maps.Equal(got, want) {
+		t.Errorf("AuthBackend.Headers = %v, want %v", got, want)
+	}
+}
+
 func TestClientAliveDefaultsAndClamping(t *testing.T) {
 	never := 0
 	negative := -1

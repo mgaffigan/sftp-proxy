@@ -3,6 +3,7 @@
   "port": 2222,
   "uploadStagingDir": "/staging",
   "authBackend": {
-    "url": "http://backend-full:8080/auth"
+    "url": "http://backend-full:8080/auth",
+    "headers": { "authorization": "Bearer integration-test-secret" }
   }
 }

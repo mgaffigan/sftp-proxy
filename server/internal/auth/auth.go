@@ -175,16 +175,21 @@ func SessionFrom(permissions *ssh.Permissions) (Session, bool) {
 
 // simpleAuth implements authBackend.url: one endpoint that takes the password
 // and connection metadata and answers with the user, in a single POST.
+// fullAuth reuses passwordVia for its own password endpoint, since the
+// contract is identical and only the destination URL differs.
 type simpleAuth struct {
 	backendClient
 }
 
 func (a *simpleAuth) Password(ctx context.Context, connection ssh.ConnMetadata, password []byte) (config.User, error) {
-	var result finalizeResponse
-	err := a.postTo(ctx, connection, a.cfg.URL, request{
+	return a.passwordVia(ctx, connection, a.cfg.URL, password)
+}
+
+func (a *simpleAuth) passwordVia(ctx context.Context, connection ssh.ConnMetadata, rawURL string, password []byte) (config.User, error) {
+	var result authResponse
+	err := a.postTo(ctx, connection, rawURL, request{
 		Connection: fromConnection(connection),
 		Password:   string(password),
-		Method:     "password",
 	}, &result)
 	if err != nil {
 		return config.User{}, err
@@ -201,8 +206,8 @@ func (a *simpleAuth) PublicKey(context.Context, ssh.ConnMetadata, ssh.PublicKey)
 }
 
 // fullAuth implements authBackend.baseURL: a lookup that publishes the methods
-// and keys allowed for the user, a per-method endpoint, and a finalize that
-// answers with the user.
+// and keys allowed for the user, then a per-method endpoint (password or
+// publickey) that authenticates and answers with the user directly.
 type fullAuth struct {
 	backendClient
 
@@ -222,11 +227,11 @@ func (a *fullAuth) Password(ctx context.Context, connection ssh.ConnMetadata, pa
 	if !slices.Contains(lookup.Methods, "password") {
 		return config.User{}, errors.New("password authentication is not allowed for this user")
 	}
-	payload := request{Connection: fromConnection(connection), Password: string(password)}
-	if err := a.post(ctx, connection, "password", payload, nil); err != nil {
+	rawURL, err := endpointURL(a.cfg.BaseURL, "password")
+	if err != nil {
 		return config.User{}, err
 	}
-	return a.finalize(ctx, connection, "password", "")
+	return (&simpleAuth{a.backendClient}).passwordVia(ctx, connection, rawURL, password)
 }
 
 func (a *fullAuth) PublicKey(ctx context.Context, connection ssh.ConnMetadata, key ssh.PublicKey) (config.User, error) {
@@ -240,7 +245,12 @@ func (a *fullAuth) PublicKey(ctx context.Context, connection ssh.ConnMetadata, k
 	if !matchesKey(lookup.AuthorizedKeys, key) {
 		return config.User{}, errors.New("public key is not authorized for this user")
 	}
-	return a.finalize(ctx, connection, "publickey", ssh.FingerprintSHA256(key))
+	var result authResponse
+	payload := request{Connection: fromConnection(connection), Fingerprint: ssh.FingerprintSHA256(key)}
+	if err := a.post(ctx, connection, "publickey", payload, &result); err != nil {
+		return config.User{}, err
+	}
+	return userFromResponse(connection, result)
 }
 
 // lookupPolicy returns the backend's policy for the user this connection is
@@ -259,19 +269,6 @@ func (a *fullAuth) lookupPolicy(ctx context.Context, connection ssh.ConnMetadata
 	}
 	a.lookedUpUser, a.lookup = connection.User(), &lookup
 	return a.lookup, nil
-}
-
-func (a *fullAuth) finalize(ctx context.Context, connection ssh.ConnMetadata, method, fingerprint string) (config.User, error) {
-	var result finalizeResponse
-	err := a.post(ctx, connection, "finalize", request{
-		Connection:  fromConnection(connection),
-		Method:      method,
-		Fingerprint: fingerprint,
-	}, &result)
-	if err != nil {
-		return config.User{}, err
-	}
-	return userFromResponse(connection, result)
 }
 
 // post sends to one of the baseURL-relative endpoints.
@@ -311,6 +308,9 @@ func (b *backendClient) postTo(ctx context.Context, connection ssh.ConnMetadata,
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	addForwardedHeaders(httpRequest, connection)
+	for name, value := range b.cfg.Headers {
+		httpRequest.Header.Set(name, value)
+	}
 	response, err := b.http.Do(httpRequest)
 	if err != nil {
 		return err
@@ -331,7 +331,7 @@ func (b *backendClient) postTo(ctx context.Context, connection ssh.ConnMetadata,
 // it can become a session: the backend may not answer with a different user
 // than the one being authenticated, and the rootfs it returns must satisfy the
 // same rules the config file does.
-func userFromResponse(connection ssh.ConnMetadata, result finalizeResponse) (config.User, error) {
+func userFromResponse(connection ssh.ConnMetadata, result authResponse) (config.User, error) {
 	user := result.User
 	if user.Username == "" {
 		user.Username = connection.User()
@@ -350,7 +350,9 @@ type lookupResponse struct {
 	AuthorizedKeys []string `json:"authorizedKeys"`
 }
 
-type finalizeResponse struct {
+// authResponse is the shared response shape for both the password and
+// publickey endpoints: the authenticated user.
+type authResponse struct {
 	User config.User `json:"user"`
 }
 
@@ -365,7 +367,6 @@ type metadata struct {
 type request struct {
 	Connection  metadata `json:"connection"`
 	Password    string   `json:"password,omitempty"`
-	Method      string   `json:"method,omitempty"`
 	Fingerprint string   `json:"fingerprint,omitempty"`
 }
 

@@ -3,6 +3,7 @@
   "port": 2222,
   "uploadStagingDir": "/staging",
   "authBackend": {
-    "baseURL": "http://backend-pubkey:8080"
+    "baseURL": "http://backend-pubkey:8080",
+    "headers": { "authorization": "Bearer integration-test-secret" }
   }
 }

@@ -4,8 +4,12 @@ import { Hono } from "hono";
 const app = new Hono();
 const origin = "http://backend-trivial:8080";
 const seedContents = "trivial outbound seed\n";
+const sharedSecret = "Bearer integration-test-secret";
 
 app.post("/auth", async (context) => {
+  if (context.req.header("authorization") !== sharedSecret) {
+    return context.body(null, 403);
+  }
   const credentials = await context.req.json();
   if (credentials.connection?.username !== "acme" || credentials.password !== "secret") {
     return context.body(null, 403);

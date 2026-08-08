@@ -68,6 +68,11 @@
           "format": "uri",
           "description": "Single endpoint for password authentication and filesystem setup."
         },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Sent as literal HTTP headers on every request to the authentication backend (lookup, password, publickey, or the single url endpoint). Use this to authenticate the proxy itself to the backend, e.g. {\"authorization\": \"Bearer ...\"}."
+        },
         "timeoutMs": {
           "type": "integer",
           "minimum": 0,

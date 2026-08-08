@@ -1,4 +1,14 @@
 services:
+  setup-trivial-keys:
+    build:
+      context: ..
+    profiles: [trivial]
+    user: "0:0"
+    volumes:
+      - trivial-client-key:/keys
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["rm -f /keys/acme /keys/acme.pub && ssh-keygen -q -t ed25519 -N '' -f /keys/acme"]
+
   backend-trivial:
     build:
       context: .
@@ -27,10 +37,14 @@ services:
       dockerfile: clients.Dockerfile
     profiles: [trivial]
     depends_on:
-      - proxy-trivial
+      proxy-trivial:
+        condition: service_started
+      setup-trivial-keys:
+        condition: service_completed_successfully
     volumes:
       - ./clients:/tests:ro
       - ./fixtures:/fixtures:ro
+      - trivial-client-key:/keys:ro
     command: ["/bin/sh", "/tests/trivial.sh"]
 
   setup-pubkey-keys:
@@ -41,7 +55,7 @@ services:
     volumes:
       - pubkey-client-key:/keys
     entrypoint: ["/bin/sh", "-ec"]
-    command: ["rm -f /keys/acme /keys/acme.pub && ssh-keygen -q -t ed25519 -N '' -f /keys/acme"]
+    command: ["rm -f /keys/acme /keys/acme.pub /keys/wrong /keys/wrong.pub && ssh-keygen -q -t ed25519 -N '' -f /keys/acme && ssh-keygen -q -t ed25519 -N '' -f /keys/wrong"]
 
   backend-pubkey:
     build:
@@ -185,3 +199,4 @@ services:
 volumes:
   full-hostkey:
   pubkey-client-key:
+  trivial-client-key:

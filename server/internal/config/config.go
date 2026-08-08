@@ -574,6 +574,9 @@ func (r RootFS) Validate() error {
 	if err := validateMethods(r.AllowedMethods, r.Backend); err != nil {
 		return err
 	}
+	if err := validatePermissions(r.Permissions, r.Backend); err != nil {
+		return err
+	}
 	if err := validateAccess(r.S3, r.Backend); err != nil {
 		return err
 	}
@@ -611,9 +614,6 @@ func (e Entry) Validate() error {
 	if e.Size < 0 || e.MaxUploadSize < 0 {
 		return errors.New("file size and upload limit cannot be negative")
 	}
-	if e.Permissions != nil && *e.Permissions > 0777 {
-		return errors.New("permissions must contain only permission bits")
-	}
 	if e.File != "" {
 		if e.Backend == "" {
 			return errors.New("file entries require a backend")
@@ -631,6 +631,9 @@ func (e Entry) Validate() error {
 		}
 	}
 	if err := validateMethods(e.AllowedMethods, e.Backend); err != nil {
+		return err
+	}
+	if err := validatePermissions(e.Permissions, e.Backend); err != nil {
 		return err
 	}
 	if err := validateAccess(e.S3, e.Backend); err != nil {
@@ -670,9 +673,24 @@ func (u User) HasAuthorizedKey(key ssh.PublicKey) bool {
 	return false
 }
 
-// supportedMethods is every HTTP method the proxy knows how to send to a
-// backend, and so the only values allowedMethods may name.
-var supportedMethods = []string{"GET", "POST", "DELETE"}
+// httpMethods is every HTTP method the proxy knows how to send to a backend,
+// and so the only values allowedMethods may name on an http:// or https://
+// entry.
+var httpMethods = []string{"GET", "POST", "DELETE"}
+
+// S3 operation names an s3:// entry's allowedMethods may state. These are the
+// only S3 API calls this backend makes, so naming one withholds exactly the
+// operation it names; s3fs checks against these same constants rather than
+// its own copy of the strings.
+const (
+	S3ListObjects  = "ListObjectsV2"
+	S3GetObject    = "GetObject"
+	S3PutObject    = "PutObject"
+	S3DeleteObject = "DeleteObject"
+	S3CopyObject   = "CopyObject"
+)
+
+var s3Methods = []string{S3ListObjects, S3GetObject, S3PutObject, S3DeleteObject, S3CopyObject}
 
 // validateMethods checks allowedMethods for a node served by backend.
 // The list constrains the requests the proxy will send to that backend, so it
@@ -689,16 +707,35 @@ func validateMethods(methods []string, backend string) error {
 	if _, local := LocalPath(backend); local {
 		return errors.New("allowedMethods does not apply to a file backend; use permissions")
 	}
+	supported := httpMethods
 	if _, _, isS3 := S3Location(backend); isS3 {
-		return errors.New("allowedMethods does not apply to an s3 backend; use permissions")
+		supported = s3Methods
 	}
 	for index, method := range methods {
-		if !slices.Contains(supportedMethods, method) {
+		if !slices.Contains(supported, method) {
 			return fmt.Errorf("unsupported allowed method %q", method)
 		}
 		if slices.Contains(methods[:index], method) {
 			return fmt.Errorf("duplicate allowed method %q", method)
 		}
+	}
+	return nil
+}
+
+// validatePermissions checks permissions for a node served by backend. An s3
+// node projects its permissions from allowedMethods instead, so a POSIX mask
+// beside it would be either redundant or contradictory, and is rejected
+// rather than silently ignored, mirroring how allowedMethods is rejected on a
+// file backend.
+func validatePermissions(permissions *uint32, backend string) error {
+	if permissions == nil {
+		return nil
+	}
+	if *permissions > 0777 {
+		return errors.New("permissions must contain only permission bits")
+	}
+	if _, _, isS3 := S3Location(backend); isS3 {
+		return errors.New("permissions does not apply to an s3 backend; use allowedMethods")
 	}
 	return nil
 }

@@ -131,7 +131,7 @@ func TestListPresentsAnUnreadableDirectoryAsEmptyWithoutARequest(t *testing.T) {
 	fake.put("docs/one.txt", "first")
 
 	node := directory(at("docs"))
-	node.Permissions = permissions(0333)
+	node.AllowedMethods = []string{config.S3PutObject}
 	children, err := backend.List(context.Background(), node)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
@@ -144,9 +144,10 @@ func TestListPresentsAnUnreadableDirectoryAsEmptyWithoutARequest(t *testing.T) {
 	}
 }
 
-// A mask is stated again on every child, which is what makes a read-only
-// directory a read-only subtree.
-func TestListedChildrenCarryTheMaskAndCredentials(t *testing.T) {
+// allowedMethods is stated again on every child, which is what makes a
+// read-only directory a read-only subtree, and a child's displayed
+// permissions are projected from it.
+func TestListedChildrenCarryTheAllowedMethodsAndCredentials(t *testing.T) {
 	fake, endpoint := listen(t)
 	backend, err := New(&config.S3Backend{}, t.TempDir())
 	if err != nil {
@@ -156,7 +157,8 @@ func TestListedChildrenCarryTheMaskAndCredentials(t *testing.T) {
 	fake.put("docs/sub/two.txt", "second")
 
 	inline := access(endpoint)
-	node := vfs.Node{Directory: "docs", Backend: "s3://" + bucketName + "/docs", S3: &inline, Permissions: permissions(0555)}
+	methods := []string{config.S3ListObjects, config.S3GetObject}
+	node := vfs.Node{Directory: "docs", Backend: "s3://" + bucketName + "/docs", S3: &inline, AllowedMethods: methods}
 	children, err := backend.List(context.Background(), node)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
@@ -168,8 +170,11 @@ func TestListedChildrenCarryTheMaskAndCredentials(t *testing.T) {
 		if child.S3 != &inline {
 			t.Errorf("%s credentials = %v, want the directory's", child.Name(), child.S3)
 		}
-		if child.Permissions == nil || *child.Permissions != 0555 {
-			t.Errorf("%s permissions = %v, want 0555", child.Name(), child.Permissions)
+		if strings.Join(child.AllowedMethods, ",") != strings.Join(methods, ",") {
+			t.Errorf("%s allowedMethods = %v, want %v", child.Name(), child.AllowedMethods, methods)
+		}
+		if child.Permissions == nil || *child.Permissions != 0444 {
+			t.Errorf("%s permissions = %v, want 0444", child.Name(), child.Permissions)
 		}
 	}
 }
@@ -245,7 +250,7 @@ func TestOpenRefusesAnUnreadableObjectAndTheBucketRoot(t *testing.T) {
 	fake.put("docs/one.txt", "first")
 
 	node := file(at("docs/one.txt"))
-	node.Permissions = permissions(0333)
+	node.AllowedMethods = []string{config.S3PutObject}
 	if _, err := backend.Open(context.Background(), node); !errors.Is(err, vfs.ErrPermission) {
 		t.Fatalf("Open() error = %v, want %v", err, vfs.ErrPermission)
 	}
@@ -352,10 +357,10 @@ func TestAnAbortedUploadStoresNothing(t *testing.T) {
 	}
 }
 
-func TestCreateRefusesWhatTheMaskWithholds(t *testing.T) {
+func TestCreateRefusesWhatAllowedMethodsWithholds(t *testing.T) {
 	backend, _, at := serve(t)
 	node := file(at("docs/new.txt"))
-	node.Permissions = permissions(0444)
+	node.AllowedMethods = []string{config.S3ListObjects, config.S3GetObject}
 	if _, err := backend.Create(context.Background(), node); !errors.Is(err, vfs.ErrPermission) {
 		t.Fatalf("Create() error = %v, want %v", err, vfs.ErrPermission)
 	}
@@ -439,7 +444,7 @@ func TestRenameRefusesToLeaveTheDirectory(t *testing.T) {
 func TestChildAppendsOneEscapedSegmentAndCarriesCreationPolicy(t *testing.T) {
 	backend, _, at := serve(t)
 	node := directory(at("docs"))
-	node.Permissions = permissions(0755)
+	node.AllowedMethods = []string{config.S3ListObjects, config.S3GetObject, config.S3PutObject}
 	node.MaxUploadSize = 4096
 
 	child, err := backend.Child(node, "hello world.txt")
@@ -455,8 +460,11 @@ func TestChildAppendsOneEscapedSegmentAndCarriesCreationPolicy(t *testing.T) {
 	if child.MaxUploadSize != 4096 {
 		t.Errorf("Child() maxUploadSize = %d, want 4096", child.MaxUploadSize)
 	}
-	if child.Permissions == nil || *child.Permissions != 0755 {
-		t.Errorf("Child() permissions = %v, want 0755", child.Permissions)
+	if strings.Join(child.AllowedMethods, ",") != strings.Join(node.AllowedMethods, ",") {
+		t.Errorf("Child() allowedMethods = %v, want %v", child.AllowedMethods, node.AllowedMethods)
+	}
+	if child.Permissions == nil || *child.Permissions != 0666 {
+		t.Errorf("Child() permissions = %v, want 0666", child.Permissions)
 	}
 }
 
@@ -600,8 +608,6 @@ func TestNewRejectsAMissingConfiguration(t *testing.T) {
 	}
 }
 
-func permissions(bits uint32) *uint32 { return &bits }
-
 func TestReadAtRefusesANegativeOffsetAndAnswersAnEmptyRead(t *testing.T) {
 	backend, fake, at := serve(t)
 	fake.put("docs/one.txt", "abcde")
@@ -701,12 +707,12 @@ func TestCreateRefusesTheBucketRoot(t *testing.T) {
 	}
 }
 
-func TestRemoveAndRenameRefuseWhatTheMaskWithholds(t *testing.T) {
+func TestRemoveAndRenameRefuseWhatAllowedMethodsWithholds(t *testing.T) {
 	backend, fake, at := serve(t)
 	fake.put("docs/one.txt", "first")
 
 	node := file(at("docs/one.txt"))
-	node.Permissions = permissions(0555)
+	node.AllowedMethods = []string{config.S3ListObjects, config.S3GetObject}
 	ctx := context.Background()
 	if err := backend.Remove(ctx, node); !errors.Is(err, vfs.ErrPermission) {
 		t.Errorf("Remove() error = %v, want %v", err, vfs.ErrPermission)

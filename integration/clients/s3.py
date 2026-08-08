@@ -92,7 +92,8 @@ assert refused(lambda: sftp.remove(renamed))
 assert refused(lambda: sftp.mkdir("/Inbound/directory"))
 assert refused(lambda: sftp.rmdir("/Outbound"))
 
-# A mask can only take permission away, and everything beneath it inherits it.
+# allowedMethods withholding PutObject/DeleteObject/CopyObject projects to
+# read-only POSIX bits, and is inherited by everything beneath the node.
 assert sftp.listdir("/ReadOnly") == ["seed.txt"]
 assert not stat.S_IMODE(sftp.stat("/ReadOnly/seed.txt").st_mode) & 0o222
 assert refused(lambda: sftp.open("/ReadOnly/blocked.txt", "wb"))
@@ -113,8 +114,8 @@ with sftp.open(nested, "wb") as destination:
 assert sorted(sftp.listdir("/Tenant/Archive")) == ["hello.txt", "tenant.txt"]
 sftp.remove(nested)
 
-# The same bucket behind a mask the backend stated is read-only, which is the
-# mask travelling down a subtree it did not configure.
+# The same bucket behind allowedMethods the backend stated as read-only, which
+# is that restriction travelling down a subtree it did not configure.
 assert refused(lambda: sftp.remove("/Tenant/ReadOnly/hello.txt"))
 
 sftp.close()

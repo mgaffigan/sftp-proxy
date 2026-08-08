@@ -527,11 +527,28 @@ func TestConfigValidateRejectsIncompleteStatedCredentials(t *testing.T) {
 	}
 }
 
-func TestConfigValidateRejectsAllowedMethodsOnAnS3Entry(t *testing.T) {
+func TestConfigValidateAcceptsAllowedMethodsOnAnS3Entry(t *testing.T) {
+	cfg := s3User("s3://acme-archive/2026", nil, configuredBucket("acme-archive"))
+	cfg.Users[0].RootFS.Children[0].AllowedMethods = []string{"ListObjectsV2", "GetObject"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestConfigValidateRejectsAnHTTPMethodOnAnS3Entry(t *testing.T) {
 	cfg := s3User("s3://acme-archive/2026", nil, configuredBucket("acme-archive"))
 	cfg.Users[0].RootFS.Children[0].AllowedMethods = []string{"GET"}
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("Validate() accepted allowedMethods on an s3 entry")
+		t.Fatal("Validate() accepted an HTTP method name on an s3 entry")
+	}
+}
+
+func TestConfigValidateRejectsPermissionsOnAnS3Entry(t *testing.T) {
+	cfg := s3User("s3://acme-archive/2026", nil, configuredBucket("acme-archive"))
+	permissions := uint32(0555)
+	cfg.Users[0].RootFS.Children[0].Permissions = &permissions
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted permissions on an s3 entry")
 	}
 }
 
@@ -603,7 +620,7 @@ func TestS3AccessLogsNoSecret(t *testing.T) {
 // refused. This is what an HTTP backend sends to hand over a tenant's bucket.
 func TestAnEntryDecodesStatedCredentials(t *testing.T) {
 	listing := `{"children":[{"directory":"Archive","backend":"s3://tenant-42-archive/2026",
-		"permissions":365,"s3":{"region":"us-east-1","endpoint":"http://minio:9000",
+		"allowedMethods":["ListObjectsV2","GetObject"],"s3":{"region":"us-east-1","endpoint":"http://minio:9000",
 		"accessKeyId":"AKIAEXAMPLE","secretAccessKey":"wJalrXUtnFEMI","sessionToken":"IQoJ"}}]}`
 
 	var decoded struct {

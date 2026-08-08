@@ -39,7 +39,7 @@ can be provided dynamically per entry.
           {
             "directory": "Outbound",
             "backend": "s3://acme-archive/outbound",
-            "permissions": 365
+            "allowedMethods": ["ListObjectsV2", "GetObject"]
           }
         ]
       }
@@ -51,9 +51,14 @@ can be provided dynamically per entry.
 The example hash is for the password `password`; generate your own with
 `docker run --rm -it sftp-proxy -hash-password`.
 
-`permissions` is a mask, as it is on a local file: a read bit permits reading
-and listing, a write bit permits every change, and everything beneath the node
-inherits it.
+You can limit the operations by setting the `allowedMethods` field on a 
+directory or file node.  The default is allow all.  Valid options are:
+
+- `ListObjectsV2`
+- `GetObject`
+- `PutObject`
+- `DeleteObject`
+- `CopyObject`
 
 ## S3-Compatible Stores
 

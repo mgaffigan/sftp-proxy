@@ -22,7 +22,7 @@ http.createServer((request, response) => {
   response.end(JSON.stringify({
     children: [
       { directory: "Archive", backend: "s3://tenant-42-archive/2026", s3: access },
-      { directory: "ReadOnly", backend: "s3://tenant-42-archive/2026", s3: access, permissions: 0o555 },
+      { directory: "ReadOnly", backend: "s3://tenant-42-archive/2026", s3: access, allowedMethods: ["ListObjectsV2", "GetObject"] },
     ],
   }));
 }).listen(8080, "0.0.0.0");

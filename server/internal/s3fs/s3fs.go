@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/url"
 	"path"
@@ -49,9 +48,6 @@ const uploadContentType = "application/octet-stream"
 // exchange, which this package does not do: a transfer that would need one is
 // refused rather than half-performed.
 const maxSingleRequestSize = 5 << 30
-
-// allBits is every permission bit: the mask a node that states none imposes.
-const allBits fs.FileMode = 0777
 
 // maxListingEntries bounds one directory listing, as maxListingBytes bounds one
 // served over HTTP. A prefix is not a directory and nothing limits how many keys
@@ -132,14 +128,14 @@ func clientOptions(access config.S3Access) func(*s3.Options) {
 }
 
 // location is where a node is: the client that can reach it, the bucket and key
-// naming it, the permissions its mask allows, and the credentials to hand to
-// everything found beneath it.
+// naming it, the S3 operations allowedMethods permits, and the credentials to
+// hand to everything found beneath it.
 type location struct {
-	client *s3.Client
-	bucket string
-	key    string
-	mask   fs.FileMode
-	access *config.S3Access
+	client  *s3.Client
+	bucket  string
+	key     string
+	methods []string
+	access  *config.S3Access
 }
 
 // resolve finds what serves a node. A node stating credentials is served with
@@ -150,7 +146,7 @@ func (b *Backend) resolve(node vfs.Node) (location, error) {
 	if !ok {
 		return location{}, vfs.ErrFailure
 	}
-	at := location{bucket: bucket, key: key, mask: mask(node), access: node.S3}
+	at := location{bucket: bucket, key: key, methods: node.AllowedMethods, access: node.S3}
 	if node.S3 != nil {
 		// Credentials that arrived with an entry are checked where they are
 		// used, not only where they were parsed, since the entry may have come
@@ -169,23 +165,16 @@ func (b *Backend) resolve(node vfs.Node) (location, error) {
 	return at, nil
 }
 
-// mask is what a node's permissions allow. An object store reports no modes of
-// its own, so unlike a local file there is nothing to narrow: the node's value
-// is the whole answer, and a listing states it again on every child, which is
-// what makes a read-only directory a read-only subtree.
-func mask(node vfs.Node) fs.FileMode {
-	if node.Permissions == nil {
-		return allBits
+// permits reports whether the proxy may make the S3 call named op against
+// this location. An empty list states nothing and so forbids nothing, as it
+// does over HTTP. It is inherited down the subtree by childNode, since every
+// member here is fabricated from a listing rather than named individually.
+func permits(methods []string, op string) bool {
+	if len(methods) == 0 {
+		return true
 	}
-	return fs.FileMode(*node.Permissions) & allBits
+	return slices.Contains(methods, op)
 }
-
-// readable and writable ask what a mode permits, as they do for a local file:
-// any read bit permits reading and listing, any write bit permits every change,
-// because the proxy is one actor rather than an owner, a group, and everyone
-// else.
-func readable(mode fs.FileMode) bool { return mode&0444 != 0 }
-func writable(mode fs.FileMode) bool { return mode&0222 != 0 }
 
 // prefix is the key every member of a directory node begins with. A bucket root
 // has no key, and so no prefix at all.
@@ -236,9 +225,10 @@ func (b *Backend) List(ctx context.Context, node vfs.Node) ([]vfs.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A directory whose mask withholds reading is presented as empty, as one
-	// served over HTTP that refuses GET is: it may still be a place to write to.
-	if !readable(at.mask) {
+	// A directory whose allowedMethods withholds ListObjectsV2 is presented as
+	// empty, as one served over HTTP that refuses GET is: it may still be a
+	// place to write to.
+	if !permits(at.methods, config.S3ListObjects) {
 		return nil, nil
 	}
 
@@ -301,11 +291,28 @@ func (b *Backend) List(ctx context.Context, node vfs.Node) ([]vfs.Node, error) {
 // whatever the store reported about it; everything else follows from being
 // found here.
 func (l location) childNode(node vfs.Node) vfs.Node {
-	permissions := uint32(l.mask)
 	node.Backend = l.childURL(node.Name())
-	node.Permissions = &permissions
+	node.AllowedMethods = l.methods
+	node.Permissions = projectedPermissions(l.methods)
 	node.S3 = l.access
 	return node
+}
+
+// projectedPermissions is the POSIX mode a node's allowedMethods project for
+// display: a client sees read bits when the proxy may list or fetch the
+// object and write bits when it may change it, since an object store reports
+// no mode of its own. An empty allowedMethods withholds nothing, and so
+// projects every bit, matching the fully-permissive default a node with no
+// stated permissions has always displayed.
+func projectedPermissions(methods []string) *uint32 {
+	var bits uint32
+	if permits(methods, config.S3ListObjects) || permits(methods, config.S3GetObject) {
+		bits |= 0444
+	}
+	if permits(methods, config.S3PutObject) || permits(methods, config.S3DeleteObject) || permits(methods, config.S3CopyObject) {
+		bits |= 0222
+	}
+	return &bits
 }
 
 func (b *Backend) Open(ctx context.Context, node vfs.Node) (vfs.ReaderAtCloser, error) {
@@ -316,7 +323,7 @@ func (b *Backend) Open(ctx context.Context, node vfs.Node) (vfs.ReaderAtCloser, 
 	if at.key == "" {
 		return nil, vfs.ErrUnsupported
 	}
-	if !readable(at.mask) {
+	if !permits(at.methods, config.S3GetObject) {
 		return nil, vfs.ErrPermission
 	}
 	head, err := at.head(ctx)
@@ -337,7 +344,7 @@ func (b *Backend) Create(ctx context.Context, node vfs.Node) (vfs.WriterAtCloser
 	if at.key == "" {
 		return nil, vfs.ErrUnsupported
 	}
-	if !writable(at.mask) {
+	if !permits(at.methods, config.S3PutObject) {
 		return nil, vfs.ErrPermission
 	}
 	return vfs.NewStagedWriter(b.stagingDir, func(contents *vfs.StagingFile) error {
@@ -377,7 +384,7 @@ func (b *Backend) Remove(ctx context.Context, node vfs.Node) error {
 	if node.IsDirectory() || at.key == "" {
 		return vfs.ErrUnsupported
 	}
-	if !writable(at.mask) {
+	if !permits(at.methods, config.S3DeleteObject) {
 		return vfs.ErrPermission
 	}
 	// Deleting a key that is not there succeeds, so asking first is what makes
@@ -407,7 +414,7 @@ func (b *Backend) Rename(ctx context.Context, node vfs.Node, from, to string) er
 	if node.IsDirectory() || at.key == "" {
 		return vfs.ErrUnsupported
 	}
-	if !writable(at.mask) {
+	if !permits(at.methods, config.S3CopyObject) || !permits(at.methods, config.S3DeleteObject) {
 		return vfs.ErrPermission
 	}
 

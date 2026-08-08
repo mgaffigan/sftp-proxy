@@ -312,13 +312,15 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 511,
-      "description": "POSIX permission bits presented to SFTP clients. On a file:// or s3:// node they are also enforced, as a mask: a read bit permits reading and listing, a write bit permits every change, and the mask is inherited by everything beneath the node. A local file is narrowed by the permissions the filesystem itself reports as well; an object store has none of its own to narrow. A mask can only take permission away."
+      "description": "POSIX permission bits presented to SFTP clients. On a file:// node they are also enforced, as a mask: a read bit permits reading and listing, a write bit permits every change, and the mask is inherited by everything beneath the node, narrowed further by what the filesystem itself reports. Not valid on an s3:// node, which projects its displayed permissions from allowedMethods instead. A mask can only take permission away."
     },
     "allowedMethods": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "enum": ["GET", "POST", "DELETE"] },
-      "description": "HTTP methods the proxy may send to this node's backend. Applies to that node alone and is never inherited by or from another. Requires an http:// or https:// backend, since it constrains requests to one; on a file:// or s3:// node use permissions instead. An omitted value allows all supported methods."
+      "items": {
+        "enum": ["GET", "POST", "DELETE", "ListObjectsV2", "GetObject", "PutObject", "DeleteObject", "CopyObject"]
+      },
+      "description": "The requests the proxy may send to this node's backend. On an http:// or https:// backend these are HTTP methods (GET, POST, DELETE), applying to that node alone and never inherited by or from another. On an s3:// backend these are S3 operation names (ListObjectsV2, GetObject, PutObject, DeleteObject, CopyObject); since every S3 child is fabricated from a bucket listing rather than named individually, the value is inherited by everything beneath the node, and the node's displayed POSIX permissions are projected from it. Not valid on a file:// node; use permissions instead. Requires a backend, since it constrains requests to one. An omitted value allows all supported operations."
     }
   }
 }

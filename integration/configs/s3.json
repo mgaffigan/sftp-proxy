@@ -30,7 +30,7 @@
           {
             "directory": "ReadOnly",
             "backend": "s3://acme-archive/outbound",
-            "permissions": 365
+            "allowedMethods": ["ListObjectsV2", "GetObject"]
           },
           {
             "directory": "Tenant",

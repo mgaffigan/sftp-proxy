@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"sftp-proxy/internal/vfs"
 )
@@ -29,7 +30,7 @@ func directory(writer http.ResponseWriter, body string) {
 func TestListDecodesADirectoryListing(t *testing.T) {
 	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
 		directory(writer, `{"children":[
-			{"file":"report.txt","size":4,"backend":"https://files.test/report.txt"},
+			{"file":"report.txt","size":4,"mtime":"2026-08-07T12:34:56Z","permissions":416,"backend":"https://files.test/report.txt"},
 			{"directory":"sub","backend":"https://files.test/sub"}
 		]}`)
 	})
@@ -43,6 +44,10 @@ func TestListDecodesADirectoryListing(t *testing.T) {
 	}
 	if children[0].Name() != "report.txt" || children[0].Size != 4 || children[0].IsDirectory() {
 		t.Errorf("file child = %+v", children[0])
+	}
+	wantMtime := time.Date(2026, time.August, 7, 12, 34, 56, 0, time.UTC)
+	if children[0].Mtime == nil || !children[0].Mtime.Equal(wantMtime) || children[0].Permissions == nil || *children[0].Permissions != 0640 {
+		t.Errorf("file metadata = mtime %v, permissions %v", children[0].Mtime, children[0].Permissions)
 	}
 	if children[1].Name() != "sub" || !children[1].IsDirectory() {
 		t.Errorf("directory child = %+v", children[1])

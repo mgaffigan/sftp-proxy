@@ -151,21 +151,29 @@ func (l lister) ListAt(target []os.FileInfo, offset int64) (int, error) {
 type fileInfo struct {
 	name  string
 	size  int64
+	mode  os.FileMode
+	mtime time.Time
 	isDir bool
 }
 
 func fileInfoFor(node vfs.Node) fileInfo {
-	return fileInfo{name: node.Name(), size: node.Size, isDir: node.IsDirectory()}
+	mode := os.FileMode(0666)
+	if node.IsDirectory() {
+		mode = os.ModeDir | 0777
+	}
+	if node.Permissions != nil {
+		mode = mode.Type() | os.FileMode(*node.Permissions)
+	}
+	mtime := time.Time{}
+	if node.Mtime != nil {
+		mtime = *node.Mtime
+	}
+	return fileInfo{name: node.Name(), size: node.Size, mode: mode, mtime: mtime, isDir: node.IsDirectory()}
 }
 
-func (f fileInfo) Name() string { return f.name }
-func (f fileInfo) Size() int64  { return f.size }
-func (f fileInfo) Mode() os.FileMode {
-	if f.isDir {
-		return os.ModeDir | 0777
-	}
-	return 0666
-}
-func (f fileInfo) ModTime() time.Time { return time.Time{} }
+func (f fileInfo) Name() string       { return f.name }
+func (f fileInfo) Size() int64        { return f.size }
+func (f fileInfo) Mode() os.FileMode  { return f.mode }
+func (f fileInfo) ModTime() time.Time { return f.mtime }
 func (f fileInfo) IsDir() bool        { return f.isDir }
 func (f fileInfo) Sys() any           { return nil }

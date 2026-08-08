@@ -71,7 +71,7 @@ listing has content type `application/vnd.sftpproxy.directory+json` and the
 documented `children` shape. Static configuration entries and entries returned
 by a dynamic backend are homomorphic: both use the `entry` shape from the
 configuration schema. A backend may therefore return `children`,
-`allowedMethods`, `size`, and `maxUploadSize` on an entry, using the same field
+`allowedMethods`, `size`, `mtime`, `permissions`, and `maxUploadSize` on an entry, using the same field
 names and shape as static configuration.
 
 A successful file response is streamed to the client; `Content-Length`,
@@ -82,6 +82,10 @@ buffered in memory.
 Directory listing file entries may include a non-negative `size` field. The
 proxy uses it as the synthetic SFTP file size so clients that stat before
 reading, including OpenSSH, can transfer dynamic files correctly.
+
+Entries may include an RFC 3339 `mtime` and numeric POSIX `permissions` bits
+from `0` through `0777`. The proxy presents supplied values as SFTP metadata;
+omitted values retain the synthetic defaults.
 
 Any entry, file or directory, may include `allowedMethods` with any of `GET`,
 `POST`, and `DELETE`. It states which requests the proxy may send to that

@@ -176,6 +176,17 @@
         "backend": { "type": "string", "format": "uri" },
         "allowedMethods": { "$ref": "#/$defs/allowedMethods" },
         "size": { "type": "integer", "minimum": 0 },
+        "mtime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional RFC 3339 modification time presented to SFTP clients."
+        },
+        "permissions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 511,
+          "description": "Optional POSIX permission bits presented to SFTP clients."
+        },
         "children": {
           "type": "array",
           "items": { "$ref": "#/$defs/entry" }

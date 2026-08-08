@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/pkg/sftp"
 
@@ -40,12 +41,17 @@ func TestFilesystemOutcomesBecomeSFTPStatuses(t *testing.T) {
 }
 
 func TestNodesBecomeFileInfo(t *testing.T) {
-	file := fileInfoFor(vfs.Node{File: "report.txt", Size: 42})
+	permissions := uint32(0640)
+	mtime := time.Date(2026, time.August, 7, 12, 34, 56, 0, time.UTC)
+	file := fileInfoFor(vfs.Node{File: "report.txt", Size: 42, Permissions: &permissions, Mtime: &mtime})
 	if file.Name() != "report.txt" || file.Size() != 42 || file.IsDir() {
 		t.Errorf("file info = %+v", file)
 	}
-	if file.Mode().IsDir() || file.Mode().Perm() != 0666 {
+	if file.Mode().IsDir() || file.Mode().Perm() != 0640 {
 		t.Errorf("file mode = %v", file.Mode())
+	}
+	if !file.ModTime().Equal(mtime) {
+		t.Errorf("file modification time = %v, want %v", file.ModTime(), mtime)
 	}
 
 	directory := fileInfoFor(vfs.Node{Directory: "outbound"})
@@ -54,6 +60,9 @@ func TestNodesBecomeFileInfo(t *testing.T) {
 	}
 	if !directory.Mode().IsDir() || directory.Mode().Perm() != 0777 {
 		t.Errorf("directory mode = %v", directory.Mode())
+	}
+	if !directory.ModTime().IsZero() {
+		t.Errorf("directory modification time = %v, want zero", directory.ModTime())
 	}
 }
 

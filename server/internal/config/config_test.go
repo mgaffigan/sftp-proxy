@@ -87,6 +87,19 @@ func TestConfigValidateAcceptsDirectoryUploadSizeLimit(t *testing.T) {
 	}
 }
 
+func TestEntryValidatesPermissionBits(t *testing.T) {
+	permissions := uint32(0640)
+	entry := Entry{File: "report.txt", Backend: "https://files.example.test/report.txt", Permissions: &permissions}
+	if err := entry.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	permissions = 01000
+	if err := entry.Validate(); err == nil {
+		t.Fatal("Validate() accepted non-permission mode bits")
+	}
+}
+
 func TestConfigValidateRejectsTraversalEntry(t *testing.T) {
 	cfg := Config{
 		HostKeyFile:      "host_key",

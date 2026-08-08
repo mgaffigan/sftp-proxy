@@ -120,13 +120,15 @@ func (r RootFS) Entry() Entry {
 }
 
 type Entry struct {
-	Directory      string   `json:"directory,omitempty"`
-	File           string   `json:"file,omitempty"`
-	Backend        string   `json:"backend,omitempty"`
-	AllowedMethods []string `json:"allowedMethods,omitempty"`
-	Size           int64    `json:"size,omitempty"`
-	Children       []Entry  `json:"children,omitempty"`
-	MaxUploadSize  int64    `json:"maxUploadSize,omitempty"`
+	Directory      string     `json:"directory,omitempty"`
+	File           string     `json:"file,omitempty"`
+	Backend        string     `json:"backend,omitempty"`
+	AllowedMethods []string   `json:"allowedMethods,omitempty"`
+	Size           int64      `json:"size,omitempty"`
+	Mtime          *time.Time `json:"mtime,omitempty"`
+	Permissions    *uint32    `json:"permissions,omitempty"`
+	Children       []Entry    `json:"children,omitempty"`
+	MaxUploadSize  int64      `json:"maxUploadSize,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -282,6 +284,9 @@ func (e Entry) Validate() error {
 	}
 	if e.Size < 0 || e.MaxUploadSize < 0 {
 		return errors.New("file size and upload limit cannot be negative")
+	}
+	if e.Permissions != nil && *e.Permissions > 0777 {
+		return errors.New("permissions must contain only permission bits")
 	}
 	if e.File != "" {
 		if e.Backend == "" {

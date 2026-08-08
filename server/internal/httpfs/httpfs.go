@@ -249,7 +249,7 @@ func (r *rangeReader) ReadAt(destination []byte, offset int64) (int, error) {
 		}
 		return count, err
 	case http.StatusOK:
-		staged, err := r.stage(response.Body)
+		staged, err := r.stage(response.Body, response.ContentLength)
 		if err != nil {
 			return 0, err
 		}
@@ -287,12 +287,13 @@ func (r *rangeReader) stagedFile() *vfs.StagingFile {
 // stage copies a whole-file response to disk and adopts it. A concurrent read
 // may have staged the same body first, in which case theirs is kept and ours
 // is discarded — either copy is the same file.
-func (r *rangeReader) stage(body io.Reader) (*vfs.StagingFile, error) {
+func (r *rangeReader) stage(body io.Reader, contentLength int64) (*vfs.StagingFile, error) {
 	staged, err := vfs.NewStagingFile(r.backend.stagingDir, "download-*")
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}
-	if _, err := io.Copy(staged, body); err != nil {
+	count, err := io.Copy(staged, body)
+	if err != nil || contentLength >= 0 && count != contentLength {
 		_ = staged.Close()
 		return nil, vfs.ErrFailure
 	}

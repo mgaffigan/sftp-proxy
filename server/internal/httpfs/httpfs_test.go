@@ -375,6 +375,29 @@ func TestOpenStagesABackendThatIgnoresRange(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsATruncatedWholeFileFallback(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		writer.Header().Set("Content-Length", "8")
+		_, _ = writer.Write([]byte("fall"))
+	})
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	for range 2 {
+		if count, err := reader.ReadAt(make([]byte, 4), 0); count != 0 || !errors.Is(err, vfs.ErrFailure) {
+			t.Fatalf("ReadAt() = (%d, %v), want (0, failure)", count, err)
+		}
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2 after rejected staging", requests)
+	}
+}
+
 func TestRedirectsMayNotLeaveTheBackend(t *testing.T) {
 	elsewhere := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		t.Error("a redirect escaped the configured backend")

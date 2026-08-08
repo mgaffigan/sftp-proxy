@@ -211,7 +211,7 @@ func (a AuthBackend) Validate() error {
 }
 
 func (u User) Validate() error {
-	if !validName(u.Username) {
+	if !ValidName(u.Username) {
 		return fmt.Errorf("invalid username %q", u.Username)
 	}
 	if u.PasswordHash == "" && len(u.AuthorizedKeys) == 0 {
@@ -279,7 +279,7 @@ func (e Entry) Validate() error {
 	if (e.Directory == "") == (e.File == "") {
 		return errors.New("exactly one of directory or file is required")
 	}
-	if !validName(e.Name()) {
+	if !ValidName(e.Name()) {
 		return fmt.Errorf("invalid entry name %q", e.Name())
 	}
 	if e.Size < 0 || e.MaxUploadSize < 0 {
@@ -364,7 +364,11 @@ func validateMethods(methods []string, backend string) error {
 	return nil
 }
 
-func validName(name string) bool {
+// ValidName reports whether name is one ordinary path component: a username, a
+// configured entry, an entry from a backend listing, or a name a client asks to
+// create. All of them answer to this, so a name that can be uploaded is a name a
+// listing can carry back.
+func ValidName(name string) bool {
 	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, "/\\\x00") && filepath.Base(name) == name
 }
 

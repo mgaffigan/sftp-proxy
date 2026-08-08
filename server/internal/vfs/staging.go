@@ -91,3 +91,11 @@ func (w *StagedWriter) Close() error {
 	}
 	return w.commit(w.file)
 }
+
+// Abort drops the staged contents without sending them anywhere. A transfer the
+// client abandoned partway has nothing worth committing, and committing it would
+// publish a truncated file under the name of a whole one.
+func (w *StagedWriter) Abort() error {
+	w.err = ErrFailure
+	return w.file.Close()
+}

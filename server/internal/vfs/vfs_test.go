@@ -396,6 +396,7 @@ func (writer *recordingWriter) WriteAt(data []byte, offset int64) (int, error) {
 }
 
 func (writer *recordingWriter) Close() error { return nil }
+func (writer *recordingWriter) Abort() error { return nil }
 
 func TestCreateEnforcesTheExactNodeUploadSize(t *testing.T) {
 	backend := newMock("mock")

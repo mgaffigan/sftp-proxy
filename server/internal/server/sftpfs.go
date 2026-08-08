@@ -22,13 +22,43 @@ import (
 // and nodes.
 type sftpFS struct {
 	fs         *vfs.FS
-	uploads    chan struct{}
+	uploads    *uploadLimiter
 	sessionCtx context.Context
 }
 
 type handlerFactory struct {
 	fs      *vfs.FS
-	uploads chan struct{}
+	uploads *uploadLimiter
+}
+
+// uploadLimiter caps the uploads one connection may have open at once.
+// maxConcurrentUploads is a property of the user rather than of any one session,
+// so a single limiter is shared by every channel on the connection, whichever
+// protocol that channel speaks. A nil limiter imposes no limit at all.
+type uploadLimiter struct {
+	slots chan struct{}
+}
+
+func newUploadLimiter(maxConcurrentUploads int) *uploadLimiter {
+	if maxConcurrentUploads <= 0 {
+		return nil
+	}
+	return &uploadLimiter{slots: make(chan struct{}, maxConcurrentUploads)}
+}
+
+// acquire takes a slot without waiting for one, reporting whether it got it. An
+// upload that has to queue is an upload the client is already holding a handle
+// open for, so refusing is the answer, not blocking.
+func (l *uploadLimiter) acquire() (release func(), ok bool) {
+	if l == nil {
+		return func() {}, true
+	}
+	select {
+	case l.slots <- struct{}{}:
+		return func() { <-l.slots }, true
+	default:
+		return nil, false
+	}
 }
 
 type uploadWriter struct {
@@ -43,16 +73,18 @@ func (w *uploadWriter) Close() error {
 	return err
 }
 
+func (w *uploadWriter) Abort() error {
+	err := w.WriterAtCloser.Abort()
+	w.once.Do(w.release)
+	return err
+}
+
 func handlers(filesystem *vfs.FS, maxConcurrentUploads int) sftp.Handlers {
 	return newHandlerFactory(filesystem, maxConcurrentUploads).handlers(context.Background())
 }
 
 func newHandlerFactory(filesystem *vfs.FS, maxConcurrentUploads int) *handlerFactory {
-	factory := &handlerFactory{fs: filesystem}
-	if maxConcurrentUploads > 0 {
-		factory.uploads = make(chan struct{}, maxConcurrentUploads)
-	}
-	return factory
+	return &handlerFactory{fs: filesystem, uploads: newUploadLimiter(maxConcurrentUploads)}
 }
 
 func (f *handlerFactory) handlers(sessionCtx context.Context) sftp.Handlers {
@@ -72,29 +104,19 @@ func (s *sftpFS) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 
 func (s *sftpFS) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	ctx, finish := s.startOperation(request, "write")
-	if s.uploads == nil {
-		writer, err := s.fs.Create(ctx, request.Filepath)
-		if err != nil {
-			finish(err)
-			return nil, statusError(err)
-		}
-		return &tracedWriter{WriterAtCloser: writer, span: trace.SpanFromContext(ctx), finish: finish}, nil
-	}
-
-	select {
-	case s.uploads <- struct{}{}:
-	default:
+	release, ok := s.uploads.acquire()
+	if !ok {
 		finish(vfs.ErrFailure)
 		return nil, statusError(vfs.ErrFailure)
 	}
 	writer, err := s.fs.Create(ctx, request.Filepath)
 	if err != nil {
-		<-s.uploads
+		release()
 		finish(err)
 		return nil, statusError(err)
 	}
 	return &tracedWriter{
-		WriterAtCloser: &uploadWriter{WriterAtCloser: writer, release: func() { <-s.uploads }},
+		WriterAtCloser: &uploadWriter{WriterAtCloser: writer, release: release},
 		span:           trace.SpanFromContext(ctx),
 		finish:         finish,
 	}, nil
@@ -230,6 +252,14 @@ func (w *tracedWriter) WriteAt(data []byte, offset int64) (int, error) {
 func (w *tracedWriter) Close() error {
 	err := w.WriterAtCloser.Close()
 	w.finish(err)
+	return err
+}
+
+// Abort ends the operation as the failure it is: the client gave up on this
+// upload, whether or not discarding what had been staged went cleanly.
+func (w *tracedWriter) Abort() error {
+	err := w.WriterAtCloser.Abort()
+	w.finish(vfs.ErrFailure)
 	return err
 }
 

@@ -26,11 +26,15 @@ var (
 type ReaderAtCloser interface {
 	io.ReaderAt
 	io.Closer
+	// Size reports the file's exact length.
+	Size() (int64, error)
 }
 
 type WriterAtCloser interface {
 	io.WriterAt
 	io.Closer
+	// Abort discards the write instead of completing it.
+	Abort() error
 }
 
 // Backend serves one storage protocol. The scheme of a node's backend URL

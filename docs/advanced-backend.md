@@ -47,6 +47,12 @@ end of a file, and the proxy answers those reads itself once a response has told
 it where the end is. A backend that omits the total, or writes it as `*`, is
 sent every one of them to refuse.
 
+The total is required for SCP downloads, not merely an economy. SCP states how
+many bytes a file has before sending any of them, and that length can only come
+from the backend saying so. A ranged file with no stated total is still readable
+over SFTP; over SCP it is refused. A backend that answers with a whole `200`
+instead needs no header, since staging the response measures it.
+
 These operations fill out the rest of an ordinary SFTP workflow:
 
 | SFTP action | HTTP request |

@@ -3,10 +3,9 @@ We're going to create a bulletproof SFTP to HTTP proxy that can serve as a front
 ## V1 Implementation Contract
 
 The first implementation is Go, using `golang.org/x/crypto/ssh` for SSH and
-`github.com/pkg/sftp` for SFTP. It supports SFTP; SCP is a required
-compatibility target, but is deferred until the SFTP implementation is proven.
-The initial virtual filesystem backend is HTTP. Local storage and S3-compatible
-backends are deferred.
+`github.com/pkg/sftp` for SFTP. It supports SFTP and SCP over the same virtual
+filesystem. The initial virtual filesystem backend is HTTP. Local storage and
+S3-compatible backends are deferred.
 
 The server uses a configured PEM host key and refuses to start if it cannot
 load it. By default it listens on TCP port 2222 on IPv4 and IPv6 wildcard
@@ -79,6 +78,13 @@ A successful file response is streamed to the client; `Content-Length`,
 offsets use RFC 9110 `Range` requests and responses are streamed rather than
 buffered in memory.
 
+A backend serving ranges must state the file's complete length in
+`Content-Range`, on a `206` and on a `416` alike. That length is the only thing
+that can be sent before a file is, so a backend which omits it or writes it as
+`*` can be read over SFTP but not downloaded over SCP. A backend answering a
+range request with the whole file is measured by staging it, which needs no
+header at all.
+
 Directory listing file entries may include a non-negative `size` field. The
 proxy uses it as the synthetic SFTP file size so clients that stat before
 reading, including OpenSSH, can transfer dynamic files correctly.
@@ -140,6 +146,29 @@ clients: list, stat, read, create, write, delete, rename, mkdir, and rmdir.
 Permission, owner, group, and timestamp updates succeed as synthetic no-ops.
 Operations requiring durable link semantics are unsupported until a backend
 contract for them exists.
+
+### SCP
+
+SCP arrives as an `exec` request rather than a subsystem, so a client runs
+`scp -t` to upload or `scp -f` to download and the two sides then take turns.
+Both directions are supported, with `-r` for whole trees and `-p` for
+modification times; `-p` on an upload is a no-op, as a setstat is. An `exec`
+request that is not an scp invocation is refused rather than answered with a
+failing command: nothing else runs here, and there is no shell, so a quoted
+remote path is unquoted by the proxy and a glob is a name rather than a pattern.
+
+Paths are relative to the virtual root, which is also what `~` and `.` mean.
+Uploading to a path that is a directory puts the file inside it under the name
+the client gave; uploading to any other path writes that path, which is how
+`scp local.txt host:remote.txt` renames on copy. Names arriving in the protocol
+are validated as single path components rather than trusted, so a client cannot
+steer a write outside the directory it named.
+
+Every session ends by sending an exit status. A path that could not be
+transferred is reported to the client in the protocol's own terms, the rest of a
+recursive transfer continues, and the session's exit status is failure. Because
+SCP states a file's length before sending it, and a `/` has no name to give a
+client, a download of the root itself as a tree is unsupported.
 
 ## Server
 The server should listen on IPv4+IPv6 on port 2222 on all interfaces unless otherwise configured.  

@@ -115,6 +115,7 @@ type testWriter struct{}
 
 func (testWriter) WriteAt(data []byte, offset int64) (int, error) { return len(data), nil }
 func (testWriter) Close() error                                   { return nil }
+func (testWriter) Abort() error                                   { return nil }
 
 type testWriteBackend struct{}
 

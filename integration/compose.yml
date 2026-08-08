@@ -65,7 +65,17 @@ services:
       - ./clients:/tests:ro
       - ./fixtures:/fixtures:ro
       - full-hostkey:/hostkey:ro
-    command: ["/bin/sh", "-ec", "python /tests/full.py && /tests/full-openssh.sh && /tests/full-lftp.sh && /tests/full-psftp.sh"]
+    command:
+      - /bin/sh
+      - -ec
+      - >
+        python /tests/full.py &&
+        /tests/full-openssh.sh &&
+        /tests/full-lftp.sh &&
+        /tests/full-psftp.sh &&
+        /tests/full-scp-openssh.sh &&
+        /tests/full-scp-pscp.sh &&
+        python /tests/full-scp.py
 
 volumes:
   full-hostkey:

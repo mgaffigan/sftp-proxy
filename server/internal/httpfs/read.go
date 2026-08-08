@@ -124,6 +124,26 @@ func (f *openFile) ReadAt(destination []byte, offset int64) (int, error) {
 	}
 }
 
+// Size reports the file's length by making the read that settles how this file
+// is served. Which reader a file gets — and with it what is known about its
+// length — is decided by its first read, so asking here is asking that read to
+// happen rather than opening a second way to decide the same thing.
+func (f *openFile) Size() (int64, error) {
+	// An empty file answers the probe with EOF, having still chosen a reader.
+	var probe [1]byte
+	if _, err := f.ReadAt(probe[:], 0); err != nil && !errors.Is(err, io.EOF) {
+		return 0, err
+	}
+
+	f.mu.Lock()
+	chosen := f.chosen
+	f.mu.Unlock()
+	if chosen == nil {
+		return 0, vfs.ErrFailure
+	}
+	return chosen.Size()
+}
+
 // next decides, under the lock, how a read proceeds: through the reader already
 // chosen, waiting on a first read in flight, or as that first read. Becoming it
 // is recorded here, so only ever one read does.
@@ -294,6 +314,18 @@ func (r *rangeReader) learn(response *http.Response) {
 	r.size.CompareAndSwap(sizeUnknown, contentRangeTotal(response.Header.Get("Content-Range")))
 }
 
+// Size reports what a response stated the file's complete length to be. A
+// backend that never states one leaves this reader with nothing to report: the
+// length can only be discovered by downloading the whole file, which is the
+// other reader's bargain, not this one's.
+func (r *rangeReader) Size() (int64, error) {
+	size := r.size.Load()
+	if size == sizeUnknown {
+		return 0, vfs.ErrUnsupported
+	}
+	return size, nil
+}
+
 func (r *rangeReader) Close() error { return nil }
 
 // stagedReader serves reads from the whole-file copy on disk that was made when
@@ -310,6 +342,15 @@ func (s *stagedReader) ReadAt(destination []byte, offset int64) (int, error) {
 		return count, err
 	}
 	return count, s.origin.opaque(err)
+}
+
+// Size is exact here, and free: the whole file is already on disk.
+func (s *stagedReader) Size() (int64, error) {
+	info, err := s.staged.Stat()
+	if err != nil {
+		return 0, s.origin.opaque(err)
+	}
+	return info.Size(), nil
 }
 
 func (s *stagedReader) Close() error { return s.staged.Close() }

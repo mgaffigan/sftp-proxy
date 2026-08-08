@@ -294,32 +294,75 @@ func (s *Server) clientAlive(connection *ssh.ServerConn, user config.User, done 
 	}
 }
 
+// serveSession runs the one thing a session channel is asked to do. A client
+// arrives speaking either SFTP, over a subsystem request, or SCP, over an exec
+// request; nothing else is run here, and asking for anything else is refused
+// rather than answered with a failing command.
 func (s *Server) serveSession(ctx context.Context, username string, remoteAddress net.Addr, channel ssh.Channel, requests <-chan *ssh.Request, requestHandlerFactory *handlerFactory) {
 	defer channel.Close()
+	attributes := append([]attribute.KeyValue{attribute.String("user.name", username)}, connectionAttributes(remoteAddress)...)
+
 	for request := range requests {
-		if request.Type != "subsystem" {
-			_ = request.Reply(false, nil)
-			continue
-		}
-
-		var payload struct{ Name string }
-		if err := ssh.Unmarshal(request.Payload, &payload); err != nil || payload.Name != "sftp" {
-			_ = request.Reply(false, nil)
-			continue
-		}
-		if err := request.Reply(true, nil); err != nil {
+		switch request.Type {
+		case "subsystem":
+			var payload struct{ Name string }
+			if err := ssh.Unmarshal(request.Payload, &payload); err != nil || payload.Name != "sftp" {
+				_ = request.Reply(false, nil)
+				continue
+			}
+			if err := request.Reply(true, nil); err != nil {
+				return
+			}
+			s.serveSFTP(ctx, attributes, channel, requestHandlerFactory)
 			return
-		}
 
-		sessionAttributes := append([]attribute.KeyValue{attribute.String("user.name", username)}, connectionAttributes(remoteAddress)...)
-		sessionCtx, span := telemetry.Tracer().Start(ctx, "sftp.session", trace.WithAttributes(sessionAttributes...))
-		requestServer := sftp.NewRequestServer(channel, requestHandlerFactory.handlers(sessionCtx))
-		if err := requestServer.Serve(); err != nil && !errors.Is(err, io.EOF) {
-			span.SetStatus(codes.Error, "serve SFTP session")
-			span.SetAttributes(attribute.String("error.type", "sftp"))
-			s.logger.Debug("serve SFTP request", "error", err)
+		case "exec":
+			var payload struct{ Command string }
+			command, ok := scpCommand{}, false
+			if err := ssh.Unmarshal(request.Payload, &payload); err == nil {
+				command, ok = parseSCPCommand(payload.Command)
+			}
+			if !ok {
+				_ = request.Reply(false, nil)
+				continue
+			}
+			if err := request.Reply(true, nil); err != nil {
+				return
+			}
+			s.serveSCP(ctx, attributes, channel, requestHandlerFactory, command)
+			return
+
+		default:
+			_ = request.Reply(false, nil)
 		}
-		span.End()
-		return
 	}
+}
+
+func (s *Server) serveSFTP(ctx context.Context, attributes []attribute.KeyValue, channel ssh.Channel, requestHandlerFactory *handlerFactory) {
+	sessionCtx, span := telemetry.Tracer().Start(ctx, "sftp.session", trace.WithAttributes(attributes...))
+	defer span.End()
+
+	requestServer := sftp.NewRequestServer(channel, requestHandlerFactory.handlers(sessionCtx))
+	if err := requestServer.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		span.SetStatus(codes.Error, "serve SFTP session")
+		span.SetAttributes(attribute.String("error.type", "sftp"))
+		s.logger.Debug("serve SFTP request", "error", err)
+	}
+}
+
+// serveSCP runs one SCP transfer and reports how it went as the exit status of
+// the command the client believes it ran. A client that is told nothing waits
+// for a status that never comes, so this is sent on every path.
+func (s *Server) serveSCP(ctx context.Context, attributes []attribute.KeyValue, channel ssh.Channel, requestHandlerFactory *handlerFactory, command scpCommand) {
+	sessionCtx, span := telemetry.Tracer().Start(ctx, "scp.session", trace.WithAttributes(attributes...))
+	defer span.End()
+
+	var status uint32
+	if !requestHandlerFactory.scp(command, channel).run(sessionCtx) {
+		status = 1
+		span.SetStatus(codes.Error, "serve SCP session")
+		span.SetAttributes(attribute.String("error.type", "scp"))
+	}
+	_ = channel.CloseWrite()
+	_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: status}))
 }

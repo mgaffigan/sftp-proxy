@@ -459,6 +459,95 @@ func TestOpenKeepsReadingWhenNoLengthIsStated(t *testing.T) {
 	}
 }
 
+func TestSizeComesFromTheStatedLength(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, contents("0123456789ab", &requests))
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	if size, err := reader.Size(); size != 12 || err != nil {
+		t.Fatalf("Size() = (%d, %v), want (12, nil)", size, err)
+	}
+	// Asking settles which reader serves this file, so the reads after it are
+	// no more expensive than they would have been on their own.
+	buffer := make([]byte, 4)
+	if count, err := reader.ReadAt(buffer, 8); count != 4 || err != nil || string(buffer) != "89ab" {
+		t.Fatalf("ReadAt() = (%d, %q, %v)", count, buffer, err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want the size to have cost one and the read one", requests)
+	}
+}
+
+func TestSizeOfAnEmptyFile(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, contents("", &requests))
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// A file with nothing in it refuses the probe, and the refusal states a
+	// length like any other response does.
+	if size, err := reader.Size(); size != 0 || err != nil {
+		t.Fatalf("Size() = (%d, %v), want (0, nil)", size, err)
+	}
+}
+
+func TestSizeOfAWholeFileFallback(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		// A backend that ignores Range and answers with the file entire.
+		_, _ = writer.Write([]byte("whole file contents"))
+	})
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// Nothing is wasted here: measuring is the same act as fetching, and the
+	// copy it leaves on disk is what the reads then come from.
+	if size, err := reader.Size(); size != 19 || err != nil {
+		t.Fatalf("Size() = (%d, %v), want (19, nil)", size, err)
+	}
+	buffer := make([]byte, 5)
+	if count, err := reader.ReadAt(buffer, 6); count != 5 || err != nil || string(buffer) != "file " {
+		t.Fatalf("ReadAt() = (%d, %q, %v)", count, buffer, err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want the file fetched once", requests)
+	}
+}
+
+func TestSizeIsUnknownWithoutAStatedLength(t *testing.T) {
+	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Range", "bytes 0-0/*")
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write([]byte("d"))
+	})
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// A backend serving ranges but never stating a total can still be read; it
+	// just cannot be measured, which is what makes the total a requirement for
+	// SCP rather than only an economy for SFTP.
+	if size, err := reader.Size(); !errors.Is(err, vfs.ErrUnsupported) {
+		t.Fatalf("Size() = (%d, %v), want unsupported", size, err)
+	}
+	if count, err := reader.ReadAt(make([]byte, 1), 0); count != 1 || err != nil {
+		t.Fatalf("ReadAt() = (%d, %v), want the file still readable", count, err)
+	}
+}
+
 func TestOpenStagesOnceUnderConcurrentFirstReads(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0

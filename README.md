@@ -1,7 +1,7 @@
 # SFTP Proxy
 
-SFTP Proxy presents HTTP-backed files to standard SFTP clients. Start with a
-configuration and an SSH host key, then point an SFTP client at port `2222`.
+SFTP Proxy presents HTTP-backed files to standard SFTP and SCP clients. Start
+with a configuration and an SSH host key, then point a client at port `2222`.
 
 Create a host key and follow one of the guides below to create `config.json`:
 
@@ -18,6 +18,15 @@ Connect with the username from your configuration:
 
 ```sh
 sftp -P 2222 acme@localhost
+```
+
+SCP works over the same filesystem. OpenSSH 9 and later run `scp` over SFTP by
+default, which needs nothing extra; `-O` selects the SCP protocol itself, and
+both are supported:
+
+```sh
+scp -O -P 2222 ./invoice.csv acme@localhost:/Inbound/
+scp -O -r -P 2222 acme@localhost:/Outbound ./downloads
 ```
 
 The example Docker command runs as root only to read the bind-mounted host key.
@@ -48,8 +57,8 @@ Adjust the relative path when the configuration lives elsewhere.
 ## Observability
 
 The proxy emits OpenTelemetry traces for SSH connections, authentication,
-SFTP sessions and operations, and outbound authentication and filesystem HTTP
-requests. With no OpenTelemetry exporter configured, completed spans are
+SFTP and SCP sessions and operations, and outbound authentication and filesystem
+HTTP requests. With no OpenTelemetry exporter configured, completed spans are
 written to standard output.
 
 Use the standard OpenTelemetry environment variables to send traces to an

@@ -3,10 +3,12 @@ package httpfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -334,6 +336,256 @@ func TestOpenReportsEOFAtTheEndOfAFile(t *testing.T) {
 			t.Fatalf("ReadAt() = (%d, %v), want (0, EOF)", count, err)
 		}
 	})
+}
+
+// contents serves a file over ranges the way a conforming backend does,
+// counting the requests it took and clamping a range that runs off the end.
+func contents(body string, requests *int) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		*requests++
+		var first, last int64
+		if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &first, &last); err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if first >= int64(len(body)) {
+			writer.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(body)))
+			writer.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		last = min(last, int64(len(body))-1)
+		writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", first, last, len(body)))
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write([]byte(body[first : last+1]))
+	}
+}
+
+func TestOpenSpendsOneRequestPerRead(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, contents("0123456789ab", &requests))
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// The first read classifies the backend as part of doing its own work, so
+	// it costs no more than the ones after it.
+	for index, offset := range []int64{0, 8, 4} {
+		buffer := make([]byte, 4)
+		count, err := reader.ReadAt(buffer, offset)
+		if count != 4 || err != nil {
+			t.Fatalf("ReadAt(%d) = (%d, %v)", offset, count, err)
+		}
+		if want := "0123456789ab"[offset : offset+4]; string(buffer) != want {
+			t.Fatalf("ReadAt(%d) read %q, want %q", offset, buffer, want)
+		}
+		if requests != index+1 {
+			t.Fatalf("requests = %d after %d reads", requests, index+1)
+		}
+	}
+}
+
+func TestOpenAnswersPastTheEndWithoutARequest(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, contents("last", &requests))
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// One read is enough to learn the length from Content-Range.
+	if count, err := reader.ReadAt(make([]byte, 8), 0); count != 4 || !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt() = (%d, %v), want (4, EOF)", count, err)
+	}
+	// A client's read-ahead past the end is answered here rather than sent on
+	// to be refused with a 416.
+	for _, offset := range []int64{4, 32768} {
+		if count, err := reader.ReadAt(make([]byte, 8), offset); count != 0 || !errors.Is(err, io.EOF) {
+			t.Fatalf("ReadAt(%d) = (%d, %v), want (0, EOF)", offset, count, err)
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want the reads past the end to cost nothing", requests)
+	}
+}
+
+func TestOpenLearnsTheLengthFromARefusedRange(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, contents("", &requests))
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// An empty file refuses every range, and says so with a length.
+	for range 3 {
+		if count, err := reader.ReadAt(make([]byte, 8), 0); count != 0 || !errors.Is(err, io.EOF) {
+			t.Fatalf("ReadAt() = (%d, %v), want (0, EOF)", count, err)
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+}
+
+func TestOpenKeepsReadingWhenNoLengthIsStated(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		// Both a header that states no total and one that cannot be parsed
+		// leave the length unknown.
+		writer.Header().Set("Content-Range", []string{"bytes 0-3/*", "gibberish"}[requests%2])
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write([]byte("data"))
+	})
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// Not knowing the length costs requests, never correctness.
+	for range 3 {
+		buffer := make([]byte, 4)
+		if count, err := reader.ReadAt(buffer, 0); count != 4 || err != nil || string(buffer) != "data" {
+			t.Fatalf("ReadAt() = (%d, %q, %v)", count, buffer, err)
+		}
+	}
+	if requests != 3 {
+		t.Fatalf("requests = %d, want one per read", requests)
+	}
+}
+
+func TestOpenStagesOnceUnderConcurrentFirstReads(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		// 200 with the whole body: the range was ignored.
+		_, _ = writer.Write([]byte("0123456789ab"))
+	})
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	// A client opens a file with a burst of pipelined reads. Only one of them
+	// may discover that this backend answers with the whole file; the rest wait
+	// for what it learns rather than each downloading their own copy.
+	var group sync.WaitGroup
+	for index := range 12 {
+		offset := int64(index % 3 * 4)
+		group.Go(func() {
+			buffer := make([]byte, 4)
+			count, err := reader.ReadAt(buffer, offset)
+			if count != 4 || err != nil {
+				t.Errorf("ReadAt(%d) = (%d, %v)", offset, count, err)
+				return
+			}
+			if want := "0123456789ab"[offset : offset+4]; string(buffer) != want {
+				t.Errorf("ReadAt(%d) read %q, want %q", offset, buffer, want)
+			}
+		})
+	}
+	group.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 1 {
+		t.Fatalf("requests = %d, want the whole file fetched once", requests)
+	}
+}
+
+func TestOpenRefusesAWholeFileAfterARangedRead(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if requests == 1 {
+			writer.Header().Set("Content-Range", "bytes 0-3/64")
+			writer.WriteHeader(http.StatusPartialContent)
+			_, _ = writer.Write([]byte("data"))
+			return
+		}
+		// The same backend, having served one range as a range, now ignores the
+		// header and answers with the whole file.
+		_, _ = writer.Write([]byte("the whole file"))
+	})
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+
+	if count, err := reader.ReadAt(make([]byte, 4), 0); count != 4 || err != nil {
+		t.Fatalf("ReadAt() = (%d, %v), want (4, nil)", count, err)
+	}
+	// Staging belongs to the reader this file was not given, and a body that
+	// cannot be seeked within is no answer to a read at an offset.
+	if count, err := reader.ReadAt(make([]byte, 4), 8); count != 0 || !errors.Is(err, vfs.ErrFailure) {
+		t.Fatalf("ReadAt() = (%d, %v), want (0, failure)", count, err)
+	}
+}
+
+func TestReadAfterCloseFails(t *testing.T) {
+	requests := 0
+	backend, url := serve(t, contents("0123456789ab", &requests))
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: url("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if count, err := reader.ReadAt(make([]byte, 4), 0); count != 4 || err != nil {
+		t.Fatalf("ReadAt() = (%d, %v), want (4, nil)", count, err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if count, err := reader.ReadAt(make([]byte, 4), 0); count != 0 || !errors.Is(err, vfs.ErrFailure) {
+		t.Fatalf("ReadAt() after Close = (%d, %v), want (0, failure)", count, err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want the read after Close to be refused locally", requests)
+	}
+}
+
+func TestCloseDuringTheFirstReadRefusesIt(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-release
+		// The whole file, which the reader would otherwise stage and hold open.
+		_, _ = writer.Write([]byte("whole file"))
+	}))
+	defer server.Close()
+	backend := New(server.Client(), t.TempDir())
+
+	reader, err := backend.Open(context.Background(), vfs.Node{File: "f", Backend: server.URL + "/f"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	outcome := make(chan error, 1)
+	go func() {
+		_, err := reader.ReadAt(make([]byte, 4), 0)
+		outcome <- err
+	}()
+
+	// Close the handle with the first read still in flight. What that read goes
+	// on to build must not outlive it, so the read is refused rather than
+	// adopted, and the staged copy it made is closed where it was made.
+	<-started
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	close(release)
+	if err := <-outcome; !errors.Is(err, vfs.ErrFailure) {
+		t.Fatalf("ReadAt() during Close = %v, want failure", err)
+	}
 }
 
 func TestOpenStagesABackendThatIgnoresRange(t *testing.T) {

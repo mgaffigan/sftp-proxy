@@ -41,6 +41,12 @@ bytes. Return `416` when the range starts after the final byte. A normal `200`
 response is also accepted; the proxy stages that file once per open SFTP handle
 to provide random access.
 
+State the file's total length in `Content-Range` — `bytes 32768-65535/1048576`
+on a `206`, or `bytes */1048576` on a `416`. SFTP clients read ahead past the
+end of a file, and the proxy answers those reads itself once a response has told
+it where the end is. A backend that omits the total, or writes it as `*`, is
+sent every one of them to refuse.
+
 These operations fill out the rest of an ordinary SFTP workflow:
 
 | SFTP action | HTTP request |

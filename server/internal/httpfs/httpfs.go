@@ -6,15 +6,12 @@ package httpfs
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
-	"sync"
 
 	"sftp-proxy/internal/config"
 	"sftp-proxy/internal/telemetry"
@@ -80,7 +77,12 @@ func (b *Backend) Open(ctx context.Context, node vfs.Node) (vfs.ReaderAtCloser, 
 	if !permits(node, http.MethodGet) {
 		return nil, vfs.ErrPermission
 	}
-	return &rangeReader{ctx: ctx, backend: b, url: node.Backend}, nil
+	return &openFile{origin: &origin{
+		ctx:        ctx,
+		client:     b.client,
+		url:        node.Backend,
+		stagingDir: b.stagingDir,
+	}}, nil
 }
 
 func (b *Backend) Create(ctx context.Context, node vfs.Node) (vfs.WriterAtCloser, error) {
@@ -190,116 +192,6 @@ func responseError(status int) error {
 	default:
 		return vfs.ErrFailure
 	}
-}
-
-// rangeReader reads a file with RFC 9110 Range requests.
-//
-// A backend that honours them is read a window at a time. One that answers a
-// range request with the whole file leaves no way to seek within the response,
-// so the body is staged on disk once and every later read is served from there.
-type rangeReader struct {
-	ctx     context.Context
-	backend *Backend
-	url     string
-
-	mu     sync.Mutex
-	staged *vfs.StagingFile
-}
-
-func (r *rangeReader) ReadAt(destination []byte, offset int64) (int, error) {
-	if len(destination) == 0 {
-		return 0, nil
-	}
-	// Only the staged file is shared state. Requests are deliberately made
-	// without the lock held, since a client reading a large file keeps several
-	// in flight at once.
-	if staged := r.stagedFile(); staged != nil {
-		return staged.ReadAt(destination, offset)
-	}
-
-	response, err := r.request(offset, len(destination))
-	if err != nil {
-		return 0, err
-	}
-	defer response.Body.Close()
-
-	switch response.StatusCode {
-	case http.StatusRequestedRangeNotSatisfiable:
-		// A client reading to the end asks one range past it.
-		return 0, io.EOF
-	case http.StatusPartialContent:
-		count, err := io.ReadFull(response.Body, destination)
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return count, io.EOF
-		}
-		return count, err
-	case http.StatusOK:
-		staged, err := r.stage(response.Body, response.ContentLength)
-		if err != nil {
-			return 0, err
-		}
-		return staged.ReadAt(destination, offset)
-	default:
-		if err := responseError(response.StatusCode); err != nil {
-			return 0, err
-		}
-		return 0, vfs.ErrFailure
-	}
-}
-
-func (r *rangeReader) request(offset int64, length int) (*http.Response, error) {
-	request, err := http.NewRequest(http.MethodGet, r.url, nil)
-	if err != nil {
-		return nil, vfs.ErrFailure
-	}
-	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(length)-1))
-
-	response, err := r.backend.client.Do(request.WithContext(r.ctx))
-	if err != nil {
-		return nil, vfs.ErrFailure
-	}
-	return response, nil
-}
-
-func (r *rangeReader) stagedFile() *vfs.StagingFile {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.staged
-}
-
-// stage copies a whole-file response to disk and adopts it. A concurrent read
-// may have staged the same body first, in which case theirs is kept and ours
-// is discarded — either copy is the same file.
-func (r *rangeReader) stage(body io.Reader, contentLength int64) (*vfs.StagingFile, error) {
-	staged, err := vfs.NewStagingFile(r.backend.stagingDir, "download-*")
-	if err != nil {
-		return nil, vfs.ErrFailure
-	}
-	count, err := io.Copy(staged, body)
-	if err != nil || contentLength >= 0 && count != contentLength {
-		_ = staged.Close()
-		return nil, vfs.ErrFailure
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.staged != nil {
-		_ = staged.Close()
-		return r.staged, nil
-	}
-	r.staged = staged
-	return staged, nil
-}
-
-func (r *rangeReader) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.staged == nil {
-		return nil
-	}
-	err := r.staged.Close()
-	r.staged = nil
-	return err
 }
 
 var _ vfs.Backend = (*Backend)(nil)

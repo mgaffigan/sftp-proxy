@@ -20,8 +20,12 @@ import (
 type fakeS3 struct {
 	bucket string
 
-	mu        sync.Mutex
-	objects   map[string][]byte
+	mu       sync.Mutex
+	objects  map[string][]byte
+	metadata map[string]map[string]string
+	// requests records what was asked of the store, and metadata what each
+	// object was stored with: the x-amz-meta-* headers of the request that
+	// wrote it, which is where a PutObject's user metadata arrives.
 	requests  []string
 	deny      bool
 	broken    bool
@@ -33,7 +37,7 @@ type fakeS3 struct {
 var modified = time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
 
 func newFakeS3(bucket string) *fakeS3 {
-	return &fakeS3{bucket: bucket, objects: make(map[string][]byte)}
+	return &fakeS3{bucket: bucket, objects: make(map[string][]byte), metadata: make(map[string]map[string]string)}
 }
 
 func (f *fakeS3) put(key, contents string) {
@@ -47,6 +51,13 @@ func (f *fakeS3) get(key string) (string, bool) {
 	defer f.mu.Unlock()
 	contents, ok := f.objects[key]
 	return string(contents), ok
+}
+
+// meta reports the user metadata an object was stored with.
+func (f *fakeS3) meta(key string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.metadata[key]
 }
 
 func (f *fakeS3) keys() []string {
@@ -219,8 +230,15 @@ func (f *fakeS3) write(writer http.ResponseWriter, request *http.Request, key st
 		f.fail(writer, http.StatusInternalServerError, "InternalError")
 		return
 	}
+	stored := map[string]string{}
+	for name, values := range request.Header {
+		if after, ok := strings.CutPrefix(strings.ToLower(name), "x-amz-meta-"); ok {
+			stored[after] = values[0]
+		}
+	}
 	f.mu.Lock()
 	f.objects[key] = contents
+	f.metadata[key] = stored
 	f.mu.Unlock()
 	writer.WriteHeader(http.StatusOK)
 }
@@ -236,7 +254,10 @@ func (f *fakeS3) copy(writer http.ResponseWriter, request *http.Request, key str
 	f.mu.Lock()
 	contents, ok := f.objects[sourceKey]
 	if ok {
+		// No MetadataDirective means COPY, so the destination is stored with the
+		// source's user metadata rather than the copy request's.
 		f.objects[key] = contents
+		f.metadata[key] = f.metadata[sourceKey]
 	}
 	f.mu.Unlock()
 	if !ok {

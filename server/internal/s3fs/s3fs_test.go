@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/headers"
 	"sftp-proxy/internal/vfs"
 )
 
@@ -274,6 +276,61 @@ func TestCreateStoresTheStagedContentOnClose(t *testing.T) {
 	}
 	if contents, ok := fake.get("docs/new.txt"); !ok || contents != "hello world" {
 		t.Fatalf("stored %q, %v, want %q", contents, ok, "hello world")
+	}
+}
+
+// upload stores contents at key through the backend, under whatever the context
+// attributes the connection with.
+func upload(t *testing.T, backend *Backend, ctx context.Context, node vfs.Node, contents string) {
+	t.Helper()
+	writer, err := backend.Create(ctx, node)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := writer.WriteAt([]byte(contents), 0); err != nil {
+		t.Fatalf("WriteAt() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestAnUploadIsStampedWithTheConnectionsHeaders(t *testing.T) {
+	backend, fake, at := serve(t)
+	stamp := map[string]string{"user-agent": "sftp-proxy", "user-agent-id": "acme"}
+
+	upload(t, backend, headers.With(context.Background(), stamp), file(at("docs/new.txt")), "hello")
+
+	if got := fake.meta("docs/new.txt"); !maps.Equal(got, stamp) {
+		t.Fatalf("metadata = %v, want %v", got, stamp)
+	}
+}
+
+func TestAnUploadUnderNoAttributionIsStampedWithNothing(t *testing.T) {
+	backend, fake, at := serve(t)
+
+	upload(t, backend, context.Background(), file(at("docs/new.txt")), "hello")
+
+	if got := fake.meta("docs/new.txt"); len(got) != 0 {
+		t.Fatalf("metadata = %v, want none", got)
+	}
+}
+
+// TestRenameKeepsTheMetadataTheUploadWasStampedWith pins the COPY directive: an
+// object says who put the bytes there, not who last moved them.
+func TestRenameKeepsTheMetadataTheUploadWasStampedWith(t *testing.T) {
+	backend, fake, at := serve(t)
+	uploader := map[string]string{"user-agent-id": "acme"}
+	mover := map[string]string{"user-agent-id": "someone-else"}
+
+	upload(t, backend, headers.With(context.Background(), uploader), file(at("docs/one.txt")), "first")
+	err := backend.Rename(headers.With(context.Background(), mover), file(at("docs/one.txt")), "/docs/one.txt", "/docs/two.txt")
+	if err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+
+	if got := fake.meta("docs/two.txt"); !maps.Equal(got, uploader) {
+		t.Fatalf("metadata = %v, want %v", got, uploader)
 	}
 }
 

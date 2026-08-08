@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/headers"
 	"sftp-proxy/internal/telemetry"
 	"sftp-proxy/internal/vfs"
 )
@@ -156,6 +157,7 @@ func (b *Backend) do(ctx context.Context, method, rawURL, contentType string, bo
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}
+	stamp(ctx, request)
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
@@ -165,6 +167,13 @@ func (b *Backend) do(ctx context.Context, method, rawURL, contentType string, bo
 		return nil, vfs.ErrFailure
 	}
 	return response, nil
+}
+
+// propagate headers from the context into the HTTP request.
+func stamp(ctx context.Context, request *http.Request) {
+	for name, value := range headers.From(ctx) {
+		request.Header.Set(name, value)
+	}
 }
 
 // permits reports whether the proxy may send method to this node. An empty

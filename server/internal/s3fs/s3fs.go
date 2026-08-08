@@ -35,6 +35,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/headers"
 	"sftp-proxy/internal/telemetry"
 	"sftp-proxy/internal/vfs"
 )
@@ -353,6 +354,7 @@ func (b *Backend) Create(ctx context.Context, node vfs.Node) (vfs.WriterAtCloser
 			Body:          contents,
 			ContentLength: aws.Int64(info.Size()),
 			ContentType:   aws.String(uploadContentType),
+			Metadata:      headers.From(ctx),
 		})
 		return outcome(ctx, err)
 	})
@@ -431,6 +433,7 @@ func (b *Backend) Rename(ctx context.Context, node vfs.Node, from, to string) er
 	case !errors.Is(err, vfs.ErrNotExist):
 		return err
 	}
+	// MetadataDirective is omitted to keep the headers from PutObject intact.
 	if _, err := at.client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(at.bucket),
 		Key:        aws.String(target),

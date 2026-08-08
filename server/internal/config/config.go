@@ -134,13 +134,14 @@ func (s *S3Backend) Bucket(name string) (S3Bucket, bool) {
 }
 
 type User struct {
-	Username             string   `json:"username"`
-	PasswordHash         string   `json:"passwordHash,omitempty"`
-	AuthorizedKeys       []string `json:"authorizedKeys,omitempty"`
-	ClientAliveMs        Millis   `json:"clientAliveMs,omitempty"`
-	ClientAliveCountMax  *int     `json:"clientAliveCountMax,omitempty"`
-	MaxConcurrentUploads int      `json:"maxConcurrentUploads,omitempty"`
-	RootFS               RootFS   `json:"rootfs"`
+	Username             string            `json:"username"`
+	PasswordHash         string            `json:"passwordHash,omitempty"`
+	AuthorizedKeys       []string          `json:"authorizedKeys,omitempty"`
+	ClientAliveMs        Millis            `json:"clientAliveMs,omitempty"`
+	ClientAliveCountMax  *int              `json:"clientAliveCountMax,omitempty"`
+	MaxConcurrentUploads int               `json:"maxConcurrentUploads,omitempty"`
+	Headers              map[string]string `json:"headers,omitempty"`
+	RootFS               RootFS            `json:"rootfs"`
 }
 
 // LoginGrace reports how long a connection may take to authenticate, after
@@ -181,6 +182,44 @@ func (u User) ClientAlive() (interval time.Duration, countMax int) {
 
 func (u User) UploadConcurrencyLimit() int {
 	return max(u.MaxConcurrentUploads, 0)
+}
+
+// The attribution a user who states no headers of their own is stamped with.
+// The names are based on AWS Transfer Family's.
+const (
+	DefaultUserAgent  = "sftp-proxy"
+	HeaderUserAgent   = "user-agent"
+	HeaderUserAgentID = "user-agent-id"
+)
+
+// RequestHeaders reports what the proxy stamps on every backend request made
+// for this user and on every object they upload.
+func (u User) RequestHeaders() map[string]string {
+	if u.Headers == nil {
+		return map[string]string{
+			HeaderUserAgent:   DefaultUserAgent,
+			HeaderUserAgentID: stampable(u.Username),
+		}
+	}
+	stamp := make(map[string]string, len(u.Headers))
+	for name, value := range u.Headers {
+		stamp[strings.ToLower(name)] = value
+	}
+	return stamp
+}
+
+// Usernames can include any UTF-8 character, but stampable rewrites them into
+// a form safe for headers and S3 metadata.
+func stampable(text string) string {
+	if text == "" {
+		return "unknown"
+	}
+	return strings.Map(func(r rune) rune {
+		if r < '!' || r > '~' {
+			return '?'
+		}
+		return r
+	}, text)
 }
 
 type RootFS struct {

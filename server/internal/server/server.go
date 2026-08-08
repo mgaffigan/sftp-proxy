@@ -20,6 +20,7 @@ import (
 
 	"sftp-proxy/internal/auth"
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/headers"
 	"sftp-proxy/internal/httpfs"
 	"sftp-proxy/internal/localfs"
 	"sftp-proxy/internal/s3fs"
@@ -210,6 +211,9 @@ func (s *Server) serveConnection(ctx context.Context, connection net.Conn) {
 	s.logger.Info("accept SSH connection", "user", sshConnection.User(), "remote", sshConnection.RemoteAddr())
 	go ssh.DiscardRequests(requests)
 
+	// Add user headers to the context for subsequent backend requests.
+	userCtx := headers.With(connectionCtx, session.User.RequestHeaders())
+
 	// One filesystem per connection, shared by every channel on it. It carries
 	// the resolution cache, so it must outlive a single channel, and it uses
 	// the connection's cookie jar by way of session.Client.
@@ -230,7 +234,7 @@ func (s *Server) serveConnection(ctx context.Context, connection net.Conn) {
 			s.logger.Debug("accept SSH channel", "error", err)
 			continue
 		}
-		go s.serveSession(connectionCtx, session.User.Username, sshConnection.RemoteAddr(), channel, requests, requestHandlerFactory)
+		go s.serveSession(userCtx, session.User.Username, sshConnection.RemoteAddr(), channel, requests, requestHandlerFactory)
 	}
 }
 

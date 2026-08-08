@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -231,6 +232,55 @@ func TestClientAliveDefaultsAndClamping(t *testing.T) {
 			interval, countMax := testCase.user.ClientAlive()
 			if interval != testCase.wantInterval || countMax != testCase.wantCountMax {
 				t.Fatalf("ClientAlive() = %v, %d, want %v, %d", interval, countMax, testCase.wantInterval, testCase.wantCountMax)
+			}
+		})
+	}
+}
+
+func TestHeadersDefaultToTheProxyAndTheUser(t *testing.T) {
+	user := User{Username: "acme"}
+	stamp := user.RequestHeaders()
+	want := map[string]string{HeaderUserAgent: DefaultUserAgent, HeaderUserAgentID: "acme"}
+	if !maps.Equal(stamp, want) {
+		t.Fatalf("RequestHeaders() = %v, want %v", stamp, want)
+	}
+}
+
+func TestStatedHeadersReplaceTheDefaults(t *testing.T) {
+	cases := []struct {
+		name   string
+		stated map[string]string
+		want   map[string]string
+	}{
+		{"a stated map is the whole map", map[string]string{"x-tenant": "42"}, map[string]string{"x-tenant": "42"}},
+		{"an empty map stamps nothing", map[string]string{}, map[string]string{}},
+		{"names are lowercased", map[string]string{"X-Tenant": "42"}, map[string]string{"x-tenant": "42"}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			stamp := User{Username: "acme", Headers: testCase.stated}.RequestHeaders()
+			if !maps.Equal(stamp, testCase.want) {
+				t.Fatalf("RequestHeaders() = %v, want %v", stamp, testCase.want)
+			}
+		})
+	}
+}
+
+// TestTheStampedUsernameIsAlwaysPrintableASCII pins the one value here that is
+// not the deployment's: an SSH username is whatever the client sent, and a CR
+// in it would otherwise make net/http refuse every request of the session.
+func TestTheStampedUsernameIsAlwaysPrintableASCII(t *testing.T) {
+	cases := []struct{ name, username, want string }{
+		{"a header split attempt", "a\r\nX: y", "a??X:?y"},
+		{"a name S3 metadata cannot carry", "üser", "?ser"},
+		{"no name at all", "", "unknown"},
+		{"an ordinary name", "acme", "acme"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			user := User{Username: testCase.username}
+			if got := user.RequestHeaders()[HeaderUserAgentID]; got != testCase.want {
+				t.Fatalf("stamped id = %q, want %q", got, testCase.want)
 			}
 		})
 	}

@@ -48,6 +48,7 @@ authentication and filesystem requests only. The proxy adds `X-Forwarded-For`,
 `X-Forwarded-Proto: ssh`, and `X-Forwarded-Host` when meaningful. Backend URLs
 may use HTTP or HTTPS as configured. Redirects follow normal user-agent cookie
 origin rules and must not escape the configured backend origin or path prefix.
+Auth backends can provide headers that are propagated to HTTP and s3.
 
 ### HTTP Virtual Filesystem Contract
 
@@ -177,6 +178,7 @@ The S3 backend is disabled by default; serving `s3://` URLs requires an explicit
 URLs never carry credentials. Authenticating buckets occurs via two paths:
 * **Static Buckets (`s3Backend.buckets`)**: Use explicit credentials or ambient IAM (`useDefaultCredentials`). Ambient identity is disabled by default and resolved at startup; missing credentials cause an immediate startup failure.
 * **Dynamic Entries**: Receive credentials (including short-lived STS tokens) via an `s3` property on the directory entry, which is inherited by all child nodes in the subtree. Dynamic entries cannot request `useDefaultCredentials` to prevent delegating the proxy's ambient identity.
+* **Headers**: AWS transfer style metadata are included by default, and can be customized by an authentication backend.
 
 **Directory Model & Permissions**
 The backend exposes a pure virtual prefix tree without placeholder objects or `mkdir` support. Empty directories do not exist; any directory that must exist prior to population must be declared in configuration via its `s3://` prefix. Permission masks are inherited across subtrees, and `allowedMethods` is rejected on S3 nodes.

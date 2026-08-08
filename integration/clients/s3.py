@@ -1,7 +1,20 @@
 import stat
 import time
 
+import boto3
 import paramiko
+from botocore.config import Config
+
+# An ordinary S3 client, used only to read back what the proxy stored. What the
+# store was told is not something SFTP can ask about.
+store = boto3.client(
+    "s3",
+    endpoint_url="http://minio:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minioadmin",
+    region_name="us-east-1",
+    config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+)
 
 
 def connect():
@@ -61,8 +74,15 @@ with sftp.open(upload, "wb") as destination:
 with sftp.open(upload, "rb") as source:
     assert source.read() == updated
 
+# The user states no headers, so the object carries the defaults, signed and
+# stored by a real object store rather than a fake one.
+stamp = {"user-agent": "sftp-proxy", "user-agent-id": "acme"}
+assert store.head_object(Bucket="acme-archive", Key="inbound/paramiko.txt")["Metadata"] == stamp
+
 sftp.rename(upload, renamed)
 assert sftp.listdir("/Inbound") == ["paramiko-renamed.txt"]
+# A rename copies the object and keeps what its upload was stamped with.
+assert store.head_object(Bucket="acme-archive", Key="inbound/paramiko-renamed.txt")["Metadata"] == stamp
 sftp.remove(renamed)
 assert sftp.listdir("/Inbound") == []
 assert refused(lambda: sftp.remove(renamed))

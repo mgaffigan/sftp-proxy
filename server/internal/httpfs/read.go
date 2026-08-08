@@ -53,6 +53,7 @@ func (o *origin) fetch(offset int64, length int) (*http.Response, error) {
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}
+	stamp(o.ctx, request)
 	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(length)-1))
 
 	response, err := o.client.Do(request.WithContext(o.ctx))

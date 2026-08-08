@@ -102,6 +102,33 @@ entry is required when the directory's `s3` property is specified.
 }
 ```
 
+## Object Provenance
+
+Every object uploaded through the proxy is stored with user metadata naming who
+sent it. By default:
+
+```
+x-amz-meta-user-agent: sftp-proxy
+x-amz-meta-user-agent-id: acme
+```
+
+These are the same two keys AWS Transfer Family writes, so a Lambda or an S3
+event consumer written against Transfer Family reads them unchanged.
+
+You can set custom metadata for each object by providing a `headers` object on the 
+user. This replaces the default headers rather than adding to them. For example:
+
+```json
+{
+  "username": "acme",
+  "passwordHash": "$2a$12$...",
+  "headers": {
+    "user-agent-id": "acme@sftp.example.com",
+    "tenant": "42"
+  },
+  "rootfs": { "backend": "s3://acme-archive/" }
+}
+```
 
 ## Limitations
 

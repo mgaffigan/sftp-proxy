@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"sftp-proxy/internal/headers"
 	"sftp-proxy/internal/vfs"
 )
 
@@ -216,6 +217,111 @@ func TestRemoveAndRenameBothDelete(t *testing.T) {
 	}
 	if requested != "DELETE /f.txt?renameTo=%2Fsome+dir%2Fmoved.txt" {
 		t.Fatalf("rename sent %q", requested)
+	}
+}
+
+// TestEveryRequestCarriesTheConnectionsHeaders covers each operation because
+// reads are built by a second, separate constructor: a header added to only one
+// of them would be missing from every byte a client downloads.
+func TestEveryRequestCarriesTheConnectionsHeaders(t *testing.T) {
+	stamp := map[string]string{"user-agent": "sftp-proxy", "user-agent-id": "acme"}
+	operations := map[string]func(context.Context, *Backend, vfs.Node) error{
+		"list": func(ctx context.Context, backend *Backend, node vfs.Node) error {
+			_, err := backend.List(ctx, node)
+			return err
+		},
+		"read": func(ctx context.Context, backend *Backend, node vfs.Node) error {
+			reader, err := backend.Open(ctx, node)
+			if err != nil {
+				return err
+			}
+			defer reader.Close()
+			_, err = reader.ReadAt(make([]byte, 4), 0)
+			return err
+		},
+		"create": func(ctx context.Context, backend *Backend, node vfs.Node) error {
+			writer, err := backend.Create(ctx, node)
+			if err != nil {
+				return err
+			}
+			if _, err := writer.WriteAt([]byte("data"), 0); err != nil {
+				return err
+			}
+			return writer.Close()
+		},
+		"mkdir": func(ctx context.Context, backend *Backend, node vfs.Node) error {
+			return backend.Mkdir(ctx, node)
+		},
+		"remove": func(ctx context.Context, backend *Backend, node vfs.Node) error {
+			return backend.Remove(ctx, node)
+		},
+		"rename": func(ctx context.Context, backend *Backend, node vfs.Node) error {
+			return backend.Rename(ctx, node, "/f", "/moved")
+		},
+	}
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			var seen http.Header
+			backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+				seen = request.Header.Clone()
+				writer.Header().Set("Content-Type", directoryContentType)
+				writer.WriteHeader(http.StatusPartialContent)
+				_, _ = writer.Write([]byte(`{"children":[]}`))
+			})
+
+			ctx := headers.With(context.Background(), stamp)
+			if err := operation(ctx, backend, vfs.Node{File: "f", Backend: url("/f")}); err != nil {
+				t.Fatalf("%s error = %v", name, err)
+			}
+			if seen.Get("User-Agent") != "sftp-proxy" || seen.Get("User-Agent-Id") != "acme" {
+				t.Fatalf("headers = %v", seen)
+			}
+		})
+	}
+}
+
+// TestConfiguredHeadersDoNotDisplaceTheProtocolsOwn builds the context directly,
+// because nothing between here and the configuration file would stop a
+// deployment naming a header the request itself needs.
+func TestConfiguredHeadersDoNotDisplaceTheProtocolsOwn(t *testing.T) {
+	stamp := map[string]string{"content-type": "text/x-not-this", "range": "bytes=99-99"}
+	ctx := headers.With(context.Background(), stamp)
+
+	var contentType string
+	backend, url := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		contentType = request.Header.Get("Content-Type")
+		writer.WriteHeader(http.StatusOK)
+	})
+	writer, err := backend.Create(ctx, vfs.Node{File: "up.txt", Backend: url("/up.txt")})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := writer.WriteAt([]byte("data"), 0); err != nil {
+		t.Fatalf("WriteAt() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if contentType != uploadContentType {
+		t.Fatalf("Content-Type = %q, want %q", contentType, uploadContentType)
+	}
+
+	var requestedRange string
+	reading, readURL := serve(t, func(writer http.ResponseWriter, request *http.Request) {
+		requestedRange = request.Header.Get("Range")
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write([]byte("port"))
+	})
+	reader, err := reading.Open(ctx, vfs.Node{File: "f", Backend: readURL("/f")})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reader.Close()
+	if _, err := reader.ReadAt(make([]byte, 4), 12); err != nil {
+		t.Fatalf("ReadAt() error = %v", err)
+	}
+	if requestedRange != "bytes=12-15" {
+		t.Fatalf("Range = %q", requestedRange)
 	}
 }
 

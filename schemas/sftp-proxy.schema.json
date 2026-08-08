@@ -201,6 +201,11 @@
           "default": 0,
           "description": "Uploads this user's SFTP connection may have open at once. 0 means no limit."
         },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Sent on every backend request made for this user, and stored as x-amz-meta-* user metadata on every object they upload. Stating any replaces the default {\"user-agent\": \"sftp-proxy\", \"user-agent-id\": \"<username>\"} entirely rather than adding to it; an empty object stamps nothing. Names are lowercased."
+        },
         "rootfs": { "$ref": "#/$defs/rootfs" }
       }
     },

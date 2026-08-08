@@ -1,3 +1,6 @@
+// Package httpfs serves virtual filesystem nodes over the HTTP backend
+// contract: GET lists a directory or reads a file, POST creates, DELETE
+// removes, and DELETE with a renameTo query moves.
 package httpfs
 
 import (
@@ -9,283 +12,151 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
-	"time"
-
-	"github.com/pkg/sftp"
 
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/vfs"
 )
 
 const directoryContentType = "application/vnd.sftproxy.directory+json"
 const directoryEntryContentType = "application/vnd.sftpproxy.directoryentry"
+const uploadContentType = "application/octet-stream"
 
-type Filesystem struct {
-	root       config.RootFS
-	stagingDir string
+// maxListingBytes bounds a directory listing response.
+const maxListingBytes = 8 << 20
+
+type Backend struct {
 	client     *http.Client
+	stagingDir string
 }
 
-type resolvedEntry struct {
-	entry   config.Entry
-	allowed []string
+func New(client *http.Client, stagingDir string) *Backend {
+	return &Backend{client: client, stagingDir: stagingDir}
 }
 
-func New(root config.RootFS, stagingDir string, client *http.Client) *Filesystem {
-	return &Filesystem{root: root, stagingDir: stagingDir, client: client}
-}
-
-func (f *Filesystem) Handlers() sftp.Handlers {
-	return sftp.Handlers{FileGet: f, FilePut: f, FileCmd: f, FileList: f}
-}
-
-func (f *Filesystem) Fileread(request *sftp.Request) (io.ReaderAt, error) {
-	entry, err := f.resolve(request.Context(), request.Filepath)
-	if err != nil {
-		return nil, err
-	}
-	if entry.entry.File == "" {
-		return nil, sftp.ErrSSHFxOpUnsupported
-	}
-	if !allows(entry.allowed, http.MethodGet) {
-		return nil, sftp.ErrSSHFxOpUnsupported
-	}
-	return &rangeReader{ctx: request.Context(), fs: f, backendURL: entry.entry.Backend}, nil
-}
-
-func (f *Filesystem) Filewrite(request *sftp.Request) (io.WriterAt, error) {
-	entry, err := f.resolveForWrite(request.Context(), request.Filepath)
-	if err != nil {
-		return nil, err
-	}
-	if entry.entry.File == "" || entry.entry.Backend == "" {
-		return nil, sftp.ErrSSHFxOpUnsupported
-	}
-	if !allows(entry.allowed, http.MethodPost) {
-		return nil, sftp.ErrSSHFxOpUnsupported
+func (b *Backend) List(ctx context.Context, node vfs.Node) ([]vfs.Node, error) {
+	// A directory that does not permit GET is presented as empty rather than
+	// asked about, which is the point of declaring allowed_methods: it keeps
+	// traffic off a backend that would only refuse it.
+	if !permits(node, http.MethodGet) {
+		return nil, nil
 	}
 
-	temporaryFile, err := os.CreateTemp(f.stagingDir, "upload-*")
-	if err != nil {
-		return nil, fmt.Errorf("create upload staging file: %w", err)
-	}
-	return &stagedUpload{
-		ctx:        request.Context(),
-		file:       temporaryFile,
-		name:       temporaryFile.Name(),
-		filesystem: f,
-		backendURL: entry.entry.Backend,
-	}, nil
-}
-
-func (f *Filesystem) Filecmd(request *sftp.Request) error {
-	switch request.Method {
-	case "Setstat":
-		if _, err := f.resolve(request.Context(), request.Filepath); err != nil {
-			return err
-		}
-		return nil
-	case "Mkdir":
-		if _, err := f.resolve(request.Context(), request.Filepath); err == nil {
-			return sftp.ErrSSHFxFailure
-		} else if !errors.Is(err, sftp.ErrSSHFxNoSuchFile) {
-			return err
-		}
-		entry, err := f.resolveForWrite(request.Context(), request.Filepath)
-		if err != nil {
-			return err
-		}
-		if !allows(entry.allowed, http.MethodPost) {
-			return sftp.ErrSSHFxOpUnsupported
-		}
-		return f.mutate(request.Context(), http.MethodPost, entry.entry.Backend, directoryEntryContentType, nil)
-	case "Remove", "Rmdir":
-		entry, err := f.resolve(request.Context(), request.Filepath)
-		if err != nil {
-			return err
-		}
-		if !allows(entry.allowed, http.MethodDelete) {
-			return sftp.ErrSSHFxOpUnsupported
-		}
-		return f.mutate(request.Context(), http.MethodDelete, entry.entry.Backend, "", nil)
-	case "Rename":
-		entry, err := f.resolve(request.Context(), request.Filepath)
-		if err != nil {
-			return err
-		}
-		if !allows(entry.allowed, http.MethodDelete) {
-			return sftp.ErrSSHFxOpUnsupported
-		}
-		target, err := virtualPathParts(request.Target)
-		if err != nil || len(target) == 0 {
-			return sftp.ErrSSHFxNoSuchFile
-		}
-		query := url.Values{"renameTo": []string{"/" + strings.Join(target, "/")}}
-		parsed, err := url.Parse(entry.entry.Backend)
-		if err != nil {
-			return sftp.ErrSSHFxFailure
-		}
-		parsed.RawQuery = query.Encode()
-		return f.mutate(request.Context(), http.MethodDelete, parsed.String(), "", nil)
-	default:
-		return sftp.ErrSSHFxOpUnsupported
-	}
-}
-
-func (f *Filesystem) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
-	entry, err := f.resolve(request.Context(), request.Filepath)
-	if err != nil {
-		return nil, err
-	}
-
-	if request.Method == "Stat" {
-		return lister{entries: []os.FileInfo{fileInfoFor(entry.entry)}}, nil
-	}
-	if request.Method != "List" {
-		return nil, sftp.ErrSSHFxOpUnsupported
-	}
-	if entry.entry.File != "" {
-		return nil, sftp.ErrSSHFxOpUnsupported
-	}
-
-	children, err := f.children(request.Context(), entry.entry)
-	if err != nil {
-		return nil, err
-	}
-	files := make([]os.FileInfo, 0, len(children))
-	for _, child := range children {
-		files = append(files, fileInfoFor(child))
-	}
-	return lister{entries: files}, nil
-}
-
-// resolve maps a virtual SFTP path onto the backend entry that serves it.
-func (f *Filesystem) resolve(ctx context.Context, rawPath string) (resolvedEntry, error) {
-	parts, err := virtualPathParts(rawPath)
-	if err != nil {
-		return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
-	}
-	root := f.root.Entry()
-	if len(parts) == 0 {
-		return resolvedEntry{entry: root, allowed: root.AllowedMethods}, nil
-	}
-
-	children, err := f.children(ctx, root)
-	if err != nil {
-		return resolvedEntry{}, err
-	}
-	for _, part := range parts[:len(parts)-1] {
-		directory, err := findChild(children, part)
-		if err != nil || directory.Directory == "" {
-			return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
-		}
-		if children, err = f.children(ctx, directory); err != nil {
-			return resolvedEntry{}, err
-		}
-	}
-
-	entry, err := findChild(children, parts[len(parts)-1])
-	if err != nil {
-		return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
-	}
-	return resolvedEntry{entry: entry, allowed: entry.AllowedMethods}, nil
-}
-
-// resolveForWrite resolves a path that a create may bring into existence.
-func (f *Filesystem) resolveForWrite(ctx context.Context, rawPath string) (resolvedEntry, error) {
-	entry, err := f.resolve(ctx, rawPath)
-	if err == nil {
-		return entry, nil
-	}
-	if !errors.Is(err, sftp.ErrSSHFxNoSuchFile) {
-		return resolvedEntry{}, err
-	}
-
-	parts, pathErr := virtualPathParts(rawPath)
-	if pathErr != nil || len(parts) == 0 {
-		return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
-	}
-	parentPath := "/" + strings.Join(parts[:len(parts)-1], "/")
-	parent, err := f.resolve(ctx, parentPath)
-	if err != nil || parent.entry.Directory == "" || parent.entry.Backend == "" {
-		return resolvedEntry{}, sftp.ErrSSHFxNoSuchFile
-	}
-	backendURL, err := appendPathSegment(parent.entry.Backend, parts[len(parts)-1])
-	if err != nil {
-		return resolvedEntry{}, sftp.ErrSSHFxFailure
-	}
-	return resolvedEntry{
-		entry:   config.Entry{File: parts[len(parts)-1], Backend: backendURL},
-		allowed: parent.entry.AllowedMethods,
-	}, nil
-}
-
-func (f *Filesystem) children(ctx context.Context, entry config.Entry) ([]config.Entry, error) {
-	if !allows(entry.AllowedMethods, http.MethodGet) {
-		return []config.Entry{}, nil
-	}
-	if entry.Backend == "" {
-		return entry.Children, nil
-	}
-
-	response, err := f.do(ctx, http.MethodGet, entry.Backend, "", nil)
+	response, err := b.do(ctx, http.MethodGet, node.Backend, "", nil)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
+	// A backend may decline to list a directory it still accepts uploads for.
 	if response.StatusCode == http.StatusMethodNotAllowed {
-		return []config.Entry{}, nil
+		return nil, nil
 	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, statusError(response.StatusCode)
-	}
-	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if err != nil || contentType != directoryContentType {
-		return nil, sftp.ErrSSHFxFailure
+	if err := responseError(response.StatusCode); err != nil {
+		return nil, err
 	}
 
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 8<<20))
+	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil || contentType != directoryContentType {
+		return nil, vfs.ErrFailure
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, maxListingBytes))
 	decoder.DisallowUnknownFields()
 	var listing struct {
 		Children []config.Entry `json:"children"`
 	}
 	if err := decoder.Decode(&listing); err != nil {
-		return nil, sftp.ErrSSHFxFailure
+		return nil, vfs.ErrFailure
 	}
 	if err := config.ValidateEntries(listing.Children); err != nil {
-		return nil, sftp.ErrSSHFxFailure
+		return nil, vfs.ErrFailure
 	}
 	return listing.Children, nil
 }
 
-func (f *Filesystem) mutate(ctx context.Context, method, rawURL, contentType string, body io.Reader) error {
-	response, err := f.do(ctx, method, rawURL, contentType, body)
+func (b *Backend) Open(ctx context.Context, node vfs.Node) (vfs.ReaderAtCloser, error) {
+	if !permits(node, http.MethodGet) {
+		return nil, vfs.ErrPermission
+	}
+	return &rangeReader{ctx: ctx, backend: b, url: node.Backend}, nil
+}
+
+func (b *Backend) Create(ctx context.Context, node vfs.Node) (vfs.WriterAtCloser, error) {
+	if !permits(node, http.MethodPost) {
+		return nil, vfs.ErrPermission
+	}
+	return vfs.NewStagedWriter(b.stagingDir, func(contents io.Reader) error {
+		return b.mutate(ctx, http.MethodPost, node.Backend, uploadContentType, contents)
+	})
+}
+
+func (b *Backend) Mkdir(ctx context.Context, node vfs.Node) error {
+	if !permits(node, http.MethodPost) {
+		return vfs.ErrPermission
+	}
+	return b.mutate(ctx, http.MethodPost, node.Backend, directoryEntryContentType, nil)
+}
+
+func (b *Backend) Remove(ctx context.Context, node vfs.Node) error {
+	if !permits(node, http.MethodDelete) {
+		return vfs.ErrPermission
+	}
+	return b.mutate(ctx, http.MethodDelete, node.Backend, "", nil)
+}
+
+// Rename is one DELETE on the source carrying where it should end up, so the
+// source's own methods are the whole decision. What the destination is, or
+// whether it can be reached at all, is the backend's answer to give.
+func (b *Backend) Rename(ctx context.Context, node vfs.Node, target string) error {
+	if !permits(node, http.MethodDelete) {
+		return vfs.ErrPermission
+	}
+	parsed, err := url.Parse(node.Backend)
+	if err != nil {
+		return vfs.ErrFailure
+	}
+	parsed.RawQuery = url.Values{"renameTo": []string{target}}.Encode()
+	return b.mutate(ctx, http.MethodDelete, parsed.String(), "", nil)
+}
+
+// Child names a member of a directory by appending one path segment to it.
+//
+// The child carries the directory's allowed_methods because a node that does
+// not exist yet has none of its own, and creating within a directory is
+// governed by that directory's POST. Nothing else is inherited: once the node
+// exists, a listing states its methods and only those apply.
+func (b *Backend) Child(node vfs.Node, name string) (vfs.Node, error) {
+	parsed, err := url.Parse(node.Backend)
+	if err != nil {
+		return vfs.Node{}, vfs.ErrFailure
+	}
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/") + "/" + name
+	return vfs.Node{File: name, Backend: parsed.String(), AllowedMethods: node.AllowedMethods}, nil
+}
+
+func (b *Backend) mutate(ctx context.Context, method, rawURL, contentType string, body io.Reader) error {
+	response, err := b.do(ctx, method, rawURL, contentType, body)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return statusError(response.StatusCode)
-	}
-	return nil
+	return responseError(response.StatusCode)
 }
 
-func (f *Filesystem) do(ctx context.Context, method, rawURL, contentType string, body io.Reader) (*http.Response, error) {
+func (b *Backend) do(ctx context.Context, method, rawURL, contentType string, body io.Reader) (*http.Response, error) {
 	request, err := http.NewRequestWithContext(ctx, method, rawURL, body)
 	if err != nil {
-		return nil, sftp.ErrSSHFxFailure
+		return nil, vfs.ErrFailure
 	}
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
 
-	client := *f.client
+	client := *b.client
 	client.CheckRedirect = sameBackendRedirect(request.URL)
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, sftp.ErrSSHFxFailure
+		return nil, vfs.ErrFailure
 	}
 	return response, nil
 }
@@ -304,233 +175,147 @@ func pathHasPrefix(candidate, prefix string) bool {
 	return candidate == prefix || strings.HasPrefix(candidate, prefix+"/")
 }
 
-func virtualPathParts(rawPath string) ([]string, error) {
-	if rawPath == "" || rawPath == "/" {
-		return nil, nil
-	}
-	if !strings.HasPrefix(rawPath, "/") {
-		return nil, errors.New("path must be absolute")
-	}
-	parts := strings.Split(strings.TrimPrefix(rawPath, "/"), "/")
-	for _, part := range parts {
-		if part == "" || part == "." || part == ".." || strings.ContainsRune(part, 0) {
-			return nil, errors.New("invalid path")
-		}
-	}
-	return parts, nil
-}
-
-func findChild(children []config.Entry, name string) (config.Entry, error) {
-	for _, child := range children {
-		if child.Directory == name || child.File == name {
-			return child, nil
-		}
-	}
-	return config.Entry{}, os.ErrNotExist
-}
-
-func appendPathSegment(rawURL, name string) (string, error) {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "", err
-	}
-	parsed.Path = strings.TrimSuffix(parsed.Path, "/") + "/" + name
-	return parsed.String(), nil
-}
-
-func statusError(status int) error {
-	switch status {
-	case http.StatusForbidden, http.StatusUnauthorized:
-		return sftp.ErrSSHFxPermissionDenied
-	case http.StatusNotFound:
-		return sftp.ErrSSHFxNoSuchFile
-	case http.StatusMethodNotAllowed:
-		return sftp.ErrSSHFxOpUnsupported
-	default:
-		return sftp.ErrSSHFxFailure
-	}
-}
-
-func allows(allowed []string, method string) bool {
-	if len(allowed) == 0 {
+// permits reports whether the proxy may send method to this node. An empty
+// list states nothing and so forbids nothing. It applies to the node that
+// carries it and is never inherited from or by another.
+func permits(node vfs.Node, method string) bool {
+	if len(node.AllowedMethods) == 0 {
 		return true
 	}
-	for _, candidate := range allowed {
-		if candidate == method {
+	for _, allowed := range node.AllowedMethods {
+		if allowed == method {
 			return true
 		}
 	}
 	return false
 }
 
+// responseError translates a status into the outcome a caller may see. Nothing
+// of the response itself travels with it.
+func responseError(status int) error {
+	switch {
+	case status >= http.StatusOK && status < http.StatusMultipleChoices:
+		return nil
+	case status == http.StatusUnauthorized, status == http.StatusForbidden:
+		return vfs.ErrPermission
+	case status == http.StatusNotFound:
+		return vfs.ErrNotExist
+	case status == http.StatusMethodNotAllowed:
+		return vfs.ErrUnsupported
+	default:
+		return vfs.ErrFailure
+	}
+}
+
+// rangeReader reads a file with RFC 9110 Range requests.
+//
+// A backend that honours them is read a window at a time. One that answers a
+// range request with the whole file leaves no way to seek within the response,
+// so the body is staged on disk once and every later read is served from there.
 type rangeReader struct {
-	ctx        context.Context
-	fs         *Filesystem
-	backendURL string
-	mu         sync.Mutex
-	stagedFile *os.File
-	stagedPath string
+	ctx     context.Context
+	backend *Backend
+	url     string
+
+	mu     sync.Mutex
+	staged *vfs.StagingFile
 }
 
 func (r *rangeReader) ReadAt(destination []byte, offset int64) (int, error) {
 	if len(destination) == 0 {
 		return 0, nil
 	}
-
-	r.mu.Lock()
-	if r.stagedFile != nil {
-		stagedFile := r.stagedFile
-		r.mu.Unlock()
-		return stagedFile.ReadAt(destination, offset)
+	// Only the staged file is shared state. Requests are deliberately made
+	// without the lock held, since a client reading a large file keeps several
+	// in flight at once.
+	if staged := r.stagedFile(); staged != nil {
+		return staged.ReadAt(destination, offset)
 	}
 
-	request, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.backendURL, nil)
+	response, err := r.request(offset, len(destination))
 	if err != nil {
-		r.mu.Unlock()
-		return 0, sftp.ErrSSHFxFailure
+		return 0, err
 	}
-	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(len(destination))-1))
-	client := *r.fs.client
+	defer response.Body.Close()
+
+	switch response.StatusCode {
+	case http.StatusRequestedRangeNotSatisfiable:
+		// A client reading to the end asks one range past it.
+		return 0, io.EOF
+	case http.StatusPartialContent:
+		count, err := io.ReadFull(response.Body, destination)
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return count, io.EOF
+		}
+		return count, err
+	case http.StatusOK:
+		staged, err := r.stage(response.Body)
+		if err != nil {
+			return 0, err
+		}
+		return staged.ReadAt(destination, offset)
+	default:
+		if err := responseError(response.StatusCode); err != nil {
+			return 0, err
+		}
+		return 0, vfs.ErrFailure
+	}
+}
+
+func (r *rangeReader) request(offset int64, length int) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.url, nil)
+	if err != nil {
+		return nil, vfs.ErrFailure
+	}
+	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(length)-1))
+
+	client := *r.backend.client
 	client.CheckRedirect = sameBackendRedirect(request.URL)
 	response, err := client.Do(request)
 	if err != nil {
-		r.mu.Unlock()
-		return 0, sftp.ErrSSHFxFailure
+		return nil, vfs.ErrFailure
+	}
+	return response, nil
+}
+
+func (r *rangeReader) stagedFile() *vfs.StagingFile {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.staged
+}
+
+// stage copies a whole-file response to disk and adopts it. A concurrent read
+// may have staged the same body first, in which case theirs is kept and ours
+// is discarded — either copy is the same file.
+func (r *rangeReader) stage(body io.Reader) (*vfs.StagingFile, error) {
+	staged, err := vfs.NewStagingFile(r.backend.stagingDir, "download-*")
+	if err != nil {
+		return nil, vfs.ErrFailure
+	}
+	if _, err := io.Copy(staged, body); err != nil {
+		_ = staged.Close()
+		return nil, vfs.ErrFailure
 	}
 
-	if response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		_ = response.Body.Close()
-		r.mu.Unlock()
-		return 0, io.EOF
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.staged != nil {
+		_ = staged.Close()
+		return r.staged, nil
 	}
-	if response.StatusCode == http.StatusOK {
-		stagedFile, err := os.CreateTemp(r.fs.stagingDir, "download-*")
-		if err == nil {
-			_, err = io.Copy(stagedFile, response.Body)
-		}
-		_ = response.Body.Close()
-		if err != nil {
-			if stagedFile != nil {
-				_ = stagedFile.Close()
-				_ = os.Remove(stagedFile.Name())
-			}
-			r.mu.Unlock()
-			return 0, sftp.ErrSSHFxFailure
-		}
-		r.stagedFile = stagedFile
-		r.stagedPath = stagedFile.Name()
-		r.mu.Unlock()
-		return stagedFile.ReadAt(destination, offset)
-	}
-	if response.StatusCode != http.StatusPartialContent {
-		_ = response.Body.Close()
-		r.mu.Unlock()
-		if response.StatusCode >= http.StatusMultipleChoices {
-			return 0, statusError(response.StatusCode)
-		}
-		return 0, sftp.ErrSSHFxFailure
-	}
-	r.mu.Unlock()
-	defer response.Body.Close()
-	count, err := io.ReadFull(response.Body, destination)
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		return count, io.EOF
-	}
-	return count, err
+	r.staged = staged
+	return staged, nil
 }
 
 func (r *rangeReader) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.stagedFile == nil {
+	if r.staged == nil {
 		return nil
 	}
-	err := r.stagedFile.Close()
-	removeErr := os.Remove(r.stagedPath)
-	r.stagedFile = nil
-	r.stagedPath = ""
-	if err != nil {
-		return err
-	}
-	return removeErr
+	err := r.staged.Close()
+	r.staged = nil
+	return err
 }
 
-type stagedUpload struct {
-	ctx        context.Context
-	file       *os.File
-	name       string
-	filesystem *Filesystem
-	backendURL string
-}
-
-func (u *stagedUpload) WriteAt(data []byte, offset int64) (int, error) {
-	return u.file.WriteAt(data, offset)
-}
-
-func (u *stagedUpload) Close() error {
-	if err := u.file.Close(); err != nil {
-		_ = os.Remove(u.name)
-		return err
-	}
-	defer os.Remove(u.name)
-
-	contents, err := os.Open(u.name)
-	if err != nil {
-		return err
-	}
-	defer contents.Close()
-	return u.filesystem.mutate(u.ctx, http.MethodPost, u.backendURL, "application/octet-stream", contents)
-}
-
-type lister struct {
-	entries []os.FileInfo
-}
-
-func (l lister) ListAt(target []os.FileInfo, offset int64) (int, error) {
-	if offset >= int64(len(l.entries)) {
-		return 0, io.EOF
-	}
-	count := copy(target, l.entries[offset:])
-	if count < len(target) {
-		return count, io.EOF
-	}
-	return count, nil
-}
-
-type fileInfo struct {
-	name string
-	size int64
-	dir  bool
-}
-
-func fileInfoFor(entry config.Entry) fileInfo {
-	return fileInfo{name: entryName(entry), size: entry.Size, dir: entry.Directory != ""}
-}
-
-func entryName(entry config.Entry) string {
-	if entry.Directory != "" {
-		return entry.Directory
-	}
-	return entry.File
-}
-
-func (f fileInfo) Name() string { return f.name }
-func (f fileInfo) Size() int64  { return f.size }
-func (f fileInfo) Mode() os.FileMode {
-	if f.dir {
-		return os.ModeDir | 0755
-	}
-	return 0644
-}
-func (f fileInfo) ModTime() time.Time { return time.Time{} }
-func (f fileInfo) IsDir() bool        { return f.dir }
-func (f fileInfo) Sys() any           { return nil }
-
-var _ sftp.FileReader = (*Filesystem)(nil)
-var _ sftp.FileWriter = (*Filesystem)(nil)
-var _ sftp.FileCmder = (*Filesystem)(nil)
-var _ sftp.FileLister = (*Filesystem)(nil)
-var _ io.ReaderAt = (*rangeReader)(nil)
-var _ io.Closer = (*rangeReader)(nil)
-var _ io.WriterAt = (*stagedUpload)(nil)
-var _ io.Closer = (*stagedUpload)(nil)
+var _ vfs.Backend = (*Backend)(nil)

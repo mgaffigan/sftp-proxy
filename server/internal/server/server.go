@@ -17,6 +17,7 @@ import (
 	"sftp-proxy/internal/auth"
 	"sftp-proxy/internal/config"
 	"sftp-proxy/internal/httpfs"
+	"sftp-proxy/internal/vfs"
 )
 
 type Server struct {
@@ -156,6 +157,11 @@ func (s *Server) serveConnection(connection net.Conn) {
 	s.logger.Info("accept SSH connection", "user", sshConnection.User(), "remote", sshConnection.RemoteAddr())
 	go ssh.DiscardRequests(requests)
 
+	// One filesystem per connection, shared by every channel on it. It carries
+	// the resolution cache, so it must outlive a single channel, and it uses
+	// the connection's cookie jar by way of session.Client.
+	filesystem := s.filesystem(session)
+
 	done := make(chan struct{})
 	defer close(done)
 	go s.clientAlive(sshConnection, session.User, done)
@@ -170,8 +176,19 @@ func (s *Server) serveConnection(connection net.Conn) {
 			s.logger.Debug("accept SSH channel", "error", err)
 			continue
 		}
-		go s.serveSession(channel, requests, session)
+		go s.serveSession(channel, requests, filesystem)
 	}
+}
+
+// filesystem assembles the user's virtual filesystem and the backends allowed
+// to serve it. A URL scheme absent from this registry cannot be reached,
+// whether it was configured or arrived in a backend's directory listing.
+func (s *Server) filesystem(session auth.Session) *vfs.FS {
+	overHTTP := httpfs.New(session.Client, s.config.UploadStagingDir)
+	return vfs.New(session.User.RootFS, vfs.Backends{
+		"http":  overHTTP,
+		"https": overHTTP,
+	})
 }
 
 // clientAlive implements the user's clientAliveMs and clientAliveCountMax:
@@ -226,7 +243,7 @@ func (s *Server) clientAlive(connection *ssh.ServerConn, user config.User, done 
 	}
 }
 
-func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request, session auth.Session) {
+func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request, filesystem *vfs.FS) {
 	defer channel.Close()
 	for request := range requests {
 		if request.Type != "subsystem" {
@@ -243,8 +260,7 @@ func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request,
 			return
 		}
 
-		filesystem := httpfs.New(session.User.RootFS, s.config.UploadStagingDir, session.Client)
-		requestServer := sftp.NewRequestServer(channel, filesystem.Handlers())
+		requestServer := sftp.NewRequestServer(channel, handlers(filesystem))
 		if err := requestServer.Serve(); err != nil && !errors.Is(err, io.EOF) {
 			s.logger.Debug("serve SFTP request", "error", err)
 		}

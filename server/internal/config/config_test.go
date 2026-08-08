@@ -53,6 +53,22 @@ func TestRootFSValidatesItsOwnBackendAndMethods(t *testing.T) {
 	}
 }
 
+func TestConfigValidateRejectsAllowedMethodsWithoutABackend(t *testing.T) {
+	// The list constrains requests to a backend, so it is meaningless on a
+	// statically served directory and is refused rather than ignored.
+	entry := Entry{
+		Directory:      "Static",
+		Children:       []Entry{{File: "a.txt", Backend: "https://files.example.test/a.txt"}},
+		AllowedMethods: []string{"GET"},
+	}
+	if err := entry.Validate(); err == nil {
+		t.Fatal("Validate() accepted allowed_methods on an entry with no backend")
+	}
+	if err := (RootFS{AllowedMethods: []string{"GET"}}).Validate(); err == nil {
+		t.Fatal("Validate() accepted allowed_methods on a root with no backend")
+	}
+}
+
 func TestConfigValidateRejectsInvalidAllowedMethod(t *testing.T) {
 	entry := Entry{Directory: "Inbound", Backend: "https://files.example.test/inbound", AllowedMethods: []string{"PUT"}}
 	if err := entry.Validate(); err == nil {

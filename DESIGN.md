@@ -78,9 +78,11 @@ proxy uses it as the synthetic SFTP file size so clients that stat before
 reading, including OpenSSH, can transfer dynamic files correctly.
 
 Any entry, file or directory, may include `allowed_methods` with any of `GET`,
-`POST`, and `DELETE`. When present, the proxy rejects other backend operations
-locally. In particular, a directory that excludes `GET` appears empty to SFTP
-clients without making an HTTP listing request.
+`POST`, and `DELETE`. It states which requests the proxy may send to that
+entry's backend, so its purpose is to keep traffic off a backend that would
+only refuse it: a directory excluding `GET` appears empty to SFTP clients with
+no listing request made. It requires a `backend`, having nothing to constrain
+without one, and is rejected rather than ignored on an entry that has none.
 
 `allowed_methods` describes the entry that carries it and nothing else. It is
 never inherited from a parent, never combined with an ancestor's, and never
@@ -91,6 +93,10 @@ backend restricting a file must say so on that file. The single case where a
 containing directory decides is creation: a path that does not exist yet has no
 entry of its own, so `POST` on the directory that would contain it is the
 permission to create within it.
+
+It is not a permission model presented to clients. The backend remains the
+authority on every request and answers `403`, `404`, or `405` as it sees fit;
+the modes an SFTP client is shown describe only whether a node is a directory.
 
 Files are uploaded by staging their SFTP writes in a private local directory.
 On a successful close, the proxy sends the completed content as `POST` with
@@ -134,6 +140,27 @@ Authentication should be possible without the backend having special knowledge o
 During a connection, the SFTP proxy server acts as the user-agent for the backend.  This includes the accumulation of cookies.  The backend should also be sent X-Forwarded-For, X-Forwarded-Proto, and other headers as is appropriate for a reverse proxy.
 
 ## Virtual Filesystem
+
+The proxy is layered so that each concern has one home. The server maps SFTP
+onto filesystem operations and knows nothing of backend URLs. The virtual
+filesystem owns paths, traversal, and which backend serves a node, and knows
+nothing of SFTP or of any storage protocol. A backend serves exactly one
+protocol and knows nothing of paths or traversal. Errors cross these boundaries
+as outcomes — not found, not permitted, not supported, failed — so that no
+backend URL or remote message can reach a client.
+
+A node's backend URL scheme selects the backend serving it, which is what
+allows one filesystem to mix them: a directory listing returned over HTTP may
+name a child served from S3, and it is reached without any configuration
+change. A deployment registers the schemes it permits, and one left
+unregistered cannot be reached however an entry names it.
+
+The virtual filesystem remembers where a path resolved to, so that repeated
+work in a directory does not re-walk its ancestors. It never remembers what a
+directory contained: listings and file metadata are fetched afresh every time,
+and a rename or removal forgets the affected path together with everything
+beneath it.
+
 After a connection has been established, the configuration provided either statically or dynamically from the backend shall be used to construct the virtual filesystem specific to the authenticated user.  The filesystem may be backed by a combination of one of three sources:
 
 1. Explicitly

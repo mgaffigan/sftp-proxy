@@ -233,7 +233,7 @@ func (r RootFS) Validate() error {
 			return err
 		}
 	}
-	if err := validateMethods(r.AllowedMethods); err != nil {
+	if err := validateMethods(r.AllowedMethods, r.Backend); err != nil {
 		return err
 	}
 	return validateChildren(r.Children, "rootfs")
@@ -251,7 +251,7 @@ func validateChildren(children []Entry, location string) error {
 		if err := child.Validate(); err != nil {
 			return fmt.Errorf("%s.children[%d]: %w", location, index, err)
 		}
-		name := child.name()
+		name := child.Name()
 		if _, exists := seenNames[name]; exists {
 			return fmt.Errorf("%s contains duplicate entry %q", location, name)
 		}
@@ -264,8 +264,8 @@ func (e Entry) Validate() error {
 	if (e.Directory == "") == (e.File == "") {
 		return errors.New("exactly one of directory or file is required")
 	}
-	if !validName(e.name()) {
-		return fmt.Errorf("invalid entry name %q", e.name())
+	if !validName(e.Name()) {
+		return fmt.Errorf("invalid entry name %q", e.Name())
 	}
 	if e.Size < 0 || e.MaxUploadSize < 0 || e.MaxConcurrentUploads < 0 {
 		return errors.New("file size and upload limits cannot be negative")
@@ -286,13 +286,18 @@ func (e Entry) Validate() error {
 			return err
 		}
 	}
-	if err := validateMethods(e.AllowedMethods); err != nil {
+	if err := validateMethods(e.AllowedMethods, e.Backend); err != nil {
 		return err
 	}
-	return validateChildren(e.Children, e.name())
+	return validateChildren(e.Children, e.Name())
 }
 
-func (e Entry) name() string {
+// IsDirectory reports the entry's kind. Exactly one of Directory and File is
+// set, so naming one is naming both.
+func (e Entry) IsDirectory() bool { return e.Directory != "" }
+
+// Name is the entry's single path component, whichever kind it is.
+func (e Entry) Name() string {
 	if e.Directory != "" {
 		return e.Directory
 	}
@@ -318,7 +323,14 @@ func (u User) HasAuthorizedKey(key ssh.PublicKey) bool {
 	return false
 }
 
-func validateMethods(methods []string) error {
+// validateMethods checks allowed_methods for a node served by backend.
+// The list constrains the requests the proxy will send to that backend, so it
+// is meaningless — and therefore rejected rather than silently ignored — on a
+// node that has no backend to send them to.
+func validateMethods(methods []string, backend string) error {
+	if len(methods) != 0 && backend == "" {
+		return errors.New("allowed_methods requires a backend")
+	}
 	seen := make(map[string]struct{}, len(methods))
 	for _, method := range methods {
 		if method != "GET" && method != "POST" && method != "DELETE" {

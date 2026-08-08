@@ -109,6 +109,12 @@
       "type": "object",
       "additionalProperties": false,
       "description": "The root directory node. Like any directory it may have a backend, its own allowed_methods, or statically configured children; a backend is what makes the root itself listable and writable.",
+      "allOf": [
+        {
+          "if": { "required": ["allowed_methods"] },
+          "then": { "required": ["backend"] }
+        }
+      ],
       "properties": {
         "backend": { "type": "string", "format": "uri" },
         "allowed_methods": { "$ref": "#/$defs/allowedMethods" },
@@ -143,6 +149,10 @@
               { "properties": { "children": { "minItems": 1 } }, "required": ["children"] }
             ]
           }
+        },
+        {
+          "if": { "required": ["allowed_methods"] },
+          "then": { "required": ["backend"] }
         }
       ],
       "properties": {
@@ -168,7 +178,7 @@
       "type": "array",
       "uniqueItems": true,
       "items": { "enum": ["GET", "POST", "DELETE"] },
-      "description": "HTTP methods the proxy may send to this node. Applies to that node alone and is never inherited by or from another. An omitted value allows all supported methods."
+      "description": "HTTP methods the proxy may send to this node's backend. Applies to that node alone and is never inherited by or from another. Requires a backend, since it constrains requests to one. An omitted value allows all supported methods."
     }
   }
 }

@@ -3,14 +3,15 @@ package auth
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"slices"
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/ssh"
@@ -187,7 +188,7 @@ func (a *fullAuth) Password(connection ssh.ConnMetadata, password []byte) (confi
 	if err != nil {
 		return config.User{}, err
 	}
-	if !allows(lookup.Methods, "password") {
+	if !slices.Contains(lookup.Methods, "password") {
 		return config.User{}, errors.New("password authentication is not allowed for this user")
 	}
 	payload := request{Connection: fromConnection(connection), Password: string(password)}
@@ -202,7 +203,7 @@ func (a *fullAuth) PublicKey(connection ssh.ConnMetadata, key ssh.PublicKey) (co
 	if err != nil {
 		return config.User{}, err
 	}
-	if !allows(lookup.Methods, "publickey") {
+	if !slices.Contains(lookup.Methods, "publickey") {
 		return config.User{}, errors.New("public-key authentication is not allowed for this user")
 	}
 	if !matchesKey(lookup.AuthorizedKeys, key) {
@@ -292,7 +293,7 @@ func (b *backendClient) postTo(connection ssh.ConnMetadata, rawURL string, paylo
 	if target == nil {
 		return nil
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(nil, response.Body, 1<<20))
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(target)
 }
@@ -371,7 +372,13 @@ func newClient() *http.Client {
 }
 
 func fromConnection(connection ssh.ConnMetadata) metadata {
-	return metadata{connection.User(), connection.RemoteAddr().String(), connection.LocalAddr().String(), string(connection.ClientVersion()), string(connection.ServerVersion())}
+	return metadata{
+		Username:      connection.User(),
+		RemoteAddress: connection.RemoteAddr().String(),
+		LocalAddress:  connection.LocalAddr().String(),
+		ClientVersion: string(connection.ClientVersion()),
+		ServerVersion: string(connection.ServerVersion()),
+	}
 }
 
 func addForwardedHeaders(request *http.Request, connection ssh.ConnMetadata) {
@@ -384,21 +391,9 @@ func addForwardedHeaders(request *http.Request, connection ssh.ConnMetadata) {
 	request.Header.Set("X-Forwarded-Host", connection.LocalAddr().String())
 }
 
-func allows(methods []string, method string) bool {
-	for _, allowed := range methods {
-		if allowed == method {
-			return true
-		}
-	}
-	return false
-}
-
 func matchesKey(encodedKeys []string, key ssh.PublicKey) bool {
-	for _, encoded := range encodedKeys {
+	return slices.ContainsFunc(encodedKeys, func(encoded string) bool {
 		candidate, _, _, _, err := ssh.ParseAuthorizedKey([]byte(encoded))
-		if err == nil && subtle.ConstantTimeCompare(candidate.Marshal(), key.Marshal()) == 1 {
-			return true
-		}
-	}
-	return false
+		return err == nil && string(candidate.Marshal()) == string(key.Marshal())
+	})
 }

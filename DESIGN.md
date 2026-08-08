@@ -59,7 +59,7 @@ attempts to resolve outside the virtual root. It never exposes backend URLs to
 the SFTP client.
 
 `rootfs` is the root directory node and behaves as any other directory does. It
-may carry a `backend`, its own `allowed_methods`, statically configured
+may carry a `backend`, its own `allowedMethods`, statically configured
 `children`, or any combination. A root with a backend is listed by `GET`ting
 that backend and is uploaded into by `POST`ing to a child of it, so clients can
 work directly in `/` without a directory being configured first. A root with
@@ -67,24 +67,30 @@ only `children` serves them statically and, having no URL, accepts no uploads
 of its own. As with any directory, a backend supersedes static children.
 
 `GET` is used for directory listings and downloads. A successful directory
-listing has content type `application/vnd.sftproxy.directory+json` and the
-documented `children` shape. A successful file response is streamed to the
-client; `Content-Length`, `Last-Modified`, and `ETag` provide synthetic SFTP
-metadata when present. Byte offsets use RFC 9110 `Range` requests and responses
-are streamed rather than buffered in memory.
+listing has content type `application/vnd.sftpproxy.directory+json` and the
+documented `children` shape. Static configuration entries and entries returned
+by a dynamic backend are homomorphic: both use the `entry` shape from the
+configuration schema. A backend may therefore return `children`,
+`allowedMethods`, `size`, `maxUploadSize`, and `maxConcurrentUploads` on an
+entry, using the same field names and shape as static configuration.
+
+A successful file response is streamed to the client; `Content-Length`,
+`Last-Modified`, and `ETag` provide synthetic SFTP metadata when present. Byte
+offsets use RFC 9110 `Range` requests and responses are streamed rather than
+buffered in memory.
 
 Directory listing file entries may include a non-negative `size` field. The
 proxy uses it as the synthetic SFTP file size so clients that stat before
 reading, including OpenSSH, can transfer dynamic files correctly.
 
-Any entry, file or directory, may include `allowed_methods` with any of `GET`,
+Any entry, file or directory, may include `allowedMethods` with any of `GET`,
 `POST`, and `DELETE`. It states which requests the proxy may send to that
 entry's backend, so its purpose is to keep traffic off a backend that would
 only refuse it: a directory excluding `GET` appears empty to SFTP clients with
 no listing request made. It requires a `backend`, having nothing to constrain
 without one, and is rejected rather than ignored on an entry that has none.
 
-`allowed_methods` describes the entry that carries it and nothing else. It is
+`allowedMethods` describes the entry that carries it and nothing else. It is
 never inherited from a parent, never combined with an ancestor's, and never
 consulted on one entry to decide an operation on another, so a writable file
 may sit inside a read-only directory and a read-only file inside a writable
@@ -111,7 +117,7 @@ An empty `POST` with content type
 deletes either a file or directory; the backend determines the target type.
 Rename is a `DELETE` to the source URL with a percent-encoded root-relative
 `renameTo` query parameter. Being one `DELETE` on one entry, it is governed by
-the source's `allowed_methods` alone. The proxy does not interpret the
+the source's `allowedMethods` alone. The proxy does not interpret the
 destination beyond validating the path: whether a rename to it is possible,
 including one that lands under a different backend, is the source backend's
 answer to give.
@@ -219,7 +225,7 @@ HTTP 200 OK if the upload is successful.
 HTTP 405 Method Not Allowed since the file can only be uploaded.  Or, if the file were found, 200 OK with the file contents would be returned.
 
 ### GET http://foo.bar.baz/blah/outbound
-HTTP 200 OK with content-type `application/vnd.sftproxy.directory+json` for a new directory listing.
+HTTP 200 OK with content-type `application/vnd.sftpproxy.directory+json` for a new directory listing.
 
 ```json
 {

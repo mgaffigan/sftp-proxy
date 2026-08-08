@@ -47,7 +47,7 @@ app.post("/auth", async (context) => {
           {
             directory: "Inbound",
             backend: `${origin}/upload`,
-            allowed_methods: ["POST"]
+            allowedMethods: ["POST"]
           },
           ...(pendingFiles.size ? [{
             directory: "Outbound",
@@ -97,7 +97,7 @@ The flows are direct:
 
 | SFTP action | Backend action |
 | --- | --- |
-| Upload `Inbound/order.csv` | `POST /upload/order.csv`; return `2xx` and do not add the file to a listing. `allowed_methods` prevents a listing request. |
+| Upload `Inbound/order.csv` | `POST /upload/order.csv`; return `2xx` and do not add the file to a listing. `allowedMethods` prevents a listing request. |
 | List `Outbound` | `seed.txt`-style entries come from the `children` returned by `/auth`; no outbound listing endpoint is needed. |
 | Download `Outbound/welcome.txt` | `GET /download/welcome.txt`; return the file body. |
 | Delete `Outbound/welcome.txt` | `DELETE /download/welcome.txt`; remove it from the pending set. |

@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 
@@ -19,7 +20,7 @@ import (
 	"sftp-proxy/internal/vfs"
 )
 
-const directoryContentType = "application/vnd.sftproxy.directory+json"
+const directoryContentType = "application/vnd.sftpproxy.directory+json"
 const directoryEntryContentType = "application/vnd.sftpproxy.directoryentry"
 const uploadContentType = "application/octet-stream"
 
@@ -37,7 +38,7 @@ func New(client *http.Client, stagingDir string) *Backend {
 
 func (b *Backend) List(ctx context.Context, node vfs.Node) ([]vfs.Node, error) {
 	// A directory that does not permit GET is presented as empty rather than
-	// asked about, which is the point of declaring allowed_methods: it keeps
+	// asked about, which is the point of declaring allowedMethods: it keeps
 	// traffic off a backend that would only refuse it.
 	if !permits(node, http.MethodGet) {
 		return nil, nil
@@ -121,7 +122,7 @@ func (b *Backend) Rename(ctx context.Context, node vfs.Node, target string) erro
 
 // Child names a member of a directory by appending one path segment to it.
 //
-// The child carries the directory's allowed_methods because a node that does
+// The child carries the directory's allowedMethods because a node that does
 // not exist yet has none of its own, and creating within a directory is
 // governed by that directory's POST. Nothing else is inherited: once the node
 // exists, a listing states its methods and only those apply.
@@ -182,12 +183,7 @@ func permits(node vfs.Node, method string) bool {
 	if len(node.AllowedMethods) == 0 {
 		return true
 	}
-	for _, allowed := range node.AllowedMethods {
-		if allowed == method {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(node.AllowedMethods, method)
 }
 
 // responseError translates a status into the outcome a caller may see. Nothing

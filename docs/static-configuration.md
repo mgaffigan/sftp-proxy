@@ -19,7 +19,7 @@ Create `config.json` beside the repository's `schemas` directory:
           {
             "directory": "Inbound",
             "backend": "https://files.example.com/inbound",
-            "allowed_methods": ["POST"]
+            "allowedMethods": ["POST"]
           }
         ]
       }
@@ -27,6 +27,10 @@ Create `config.json` beside the repository's `schemas` directory:
   ]
 }
 ```
+
+By default the proxy listens on all IPv4 and IPv6 interfaces. Set
+`bindAddress` to restrict listening to a specific address, such as
+`127.0.0.1` for a host-local deployment.
 
 `passwordHash` uses bcrypt. Generate a cost-12 hash by running the proxy in
 password-hash mode; it prompts without echoing the password:
@@ -50,7 +54,7 @@ Content-Type: application/octet-stream
 Return any `2xx` response after storing the body. Files are first staged
 privately by the proxy, so an incomplete SFTP upload is never sent.
 
-`allowed_methods` keeps `Inbound` drop-only: the proxy returns an empty client
+`allowedMethods` keeps `Inbound` drop-only: the proxy returns an empty client
 listing without sending a `GET` to the backend, and only sends `POST` for an
 upload. The value accepts `GET`, `POST`, and `DELETE`; omit it for an entry that
 supports all of those methods.

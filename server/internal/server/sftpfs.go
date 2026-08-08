@@ -138,8 +138,3 @@ func (f fileInfo) Mode() os.FileMode {
 func (f fileInfo) ModTime() time.Time { return time.Time{} }
 func (f fileInfo) IsDir() bool        { return f.isDir }
 func (f fileInfo) Sys() any           { return nil }
-
-var _ sftp.FileReader = (*sftpFS)(nil)
-var _ sftp.FileWriter = (*sftpFS)(nil)
-var _ sftp.FileCmder = (*sftpFS)(nil)
-var _ sftp.FileLister = (*sftpFS)(nil)

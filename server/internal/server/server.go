@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -78,12 +79,42 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 func (s *Server) listenAll() ([]net.Listener, error) {
+	port := strconv.Itoa(s.config.Port)
 	addresses := []struct {
 		network string
 		address string
-	}{
-		{network: "tcp4", address: fmt.Sprintf("0.0.0.0:%d", s.config.Port)},
-		{network: "tcp6", address: fmt.Sprintf("[::]:%d", s.config.Port)},
+	}{}
+	if ip := net.ParseIP(s.config.BindAddress); ip != nil {
+		network := "tcp6"
+		if ip.To4() != nil {
+			network = "tcp4"
+		}
+		addresses = append(addresses, struct {
+			network string
+			address string
+		}{network: network, address: net.JoinHostPort(s.config.BindAddress, port)})
+	} else if s.config.BindAddress != "" {
+		addresses = append(addresses,
+			struct {
+				network string
+				address string
+			}{network: "tcp4", address: net.JoinHostPort(s.config.BindAddress, port)},
+			struct {
+				network string
+				address string
+			}{network: "tcp6", address: net.JoinHostPort(s.config.BindAddress, port)},
+		)
+	} else {
+		addresses = append(addresses,
+			struct {
+				network string
+				address string
+			}{network: "tcp4", address: net.JoinHostPort("0.0.0.0", port)},
+			struct {
+				network string
+				address string
+			}{network: "tcp6", address: net.JoinHostPort("::", port)},
+		)
 	}
 
 	listeners := make([]net.Listener, 0, len(addresses))

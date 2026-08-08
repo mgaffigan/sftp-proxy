@@ -11,11 +11,12 @@ Give a directory its own backend URL when clients need a current listing:
 ```
 
 On `GET /outbound`, return the directory media type and one entry per child.
-Include `size` for files so SFTP clients that stat before downloading know when
-to stop:
+Dynamic listing entries use the same shape as static configuration entries, so
+they may include the same settings and options. Include `size` for
+files so SFTP clients that stat before downloading know when to stop:
 
 ```http
-Content-Type: application/vnd.sftproxy.directory+json
+Content-Type: application/vnd.sftpproxy.directory+json
 ```
 
 ```json

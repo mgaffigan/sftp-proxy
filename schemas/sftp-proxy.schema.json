@@ -25,6 +25,10 @@
       "maximum": 65535,
       "default": 2222
     },
+    "bindAddress": {
+      "type": "string",
+      "description": "Address to bind the listener to. Omit to listen on all IPv4 and IPv6 interfaces."
+    },
     "uploadStagingDir": {
       "type": "string",
       "minLength": 1,
@@ -108,16 +112,16 @@
     "rootfs": {
       "type": "object",
       "additionalProperties": false,
-      "description": "The root directory node. Like any directory it may have a backend, its own allowed_methods, or statically configured children; a backend is what makes the root itself listable and writable.",
+      "description": "The root directory node. Like any directory it may have a backend, its own allowedMethods, or statically configured children; a backend is what makes the root itself listable and writable.",
       "allOf": [
         {
-          "if": { "required": ["allowed_methods"] },
+          "if": { "required": ["allowedMethods"] },
           "then": { "required": ["backend"] }
         }
       ],
       "properties": {
         "backend": { "type": "string", "format": "uri" },
-        "allowed_methods": { "$ref": "#/$defs/allowedMethods" },
+        "allowedMethods": { "$ref": "#/$defs/allowedMethods" },
         "children": {
           "type": "array",
           "items": { "$ref": "#/$defs/entry" }
@@ -151,7 +155,7 @@
           }
         },
         {
-          "if": { "required": ["allowed_methods"] },
+          "if": { "required": ["allowedMethods"] },
           "then": { "required": ["backend"] }
         }
       ],
@@ -159,7 +163,7 @@
         "directory": { "$ref": "#/$defs/name" },
         "file": { "$ref": "#/$defs/name" },
         "backend": { "type": "string", "format": "uri" },
-        "allowed_methods": { "$ref": "#/$defs/allowedMethods" },
+        "allowedMethods": { "$ref": "#/$defs/allowedMethods" },
         "size": { "type": "integer", "minimum": 0 },
         "children": {
           "type": "array",

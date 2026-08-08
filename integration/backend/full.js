@@ -62,7 +62,7 @@ http.createServer(async (request, response) => {
 
   const path = backendPath(url.pathname);
   if (request.method === "GET" && directories.has(path)) {
-    response.writeHead(200, { "Content-Type": "application/vnd.sftproxy.directory+json" });
+    response.writeHead(200, { "Content-Type": "application/vnd.sftpproxy.directory+json" });
     response.end(JSON.stringify({ children: childEntries(path) }));
     return;
   }

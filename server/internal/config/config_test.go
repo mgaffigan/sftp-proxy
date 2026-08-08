@@ -62,10 +62,10 @@ func TestConfigValidateRejectsAllowedMethodsWithoutABackend(t *testing.T) {
 		AllowedMethods: []string{"GET"},
 	}
 	if err := entry.Validate(); err == nil {
-		t.Fatal("Validate() accepted allowed_methods on an entry with no backend")
+		t.Fatal("Validate() accepted allowedMethods on an entry with no backend")
 	}
 	if err := (RootFS{AllowedMethods: []string{"GET"}}).Validate(); err == nil {
-		t.Fatal("Validate() accepted allowed_methods on a root with no backend")
+		t.Fatal("Validate() accepted allowedMethods on a root with no backend")
 	}
 }
 

@@ -89,6 +89,23 @@ func TestClientAliveDisabled(t *testing.T) {
 	}
 }
 
+func TestListenAllSelectsConfiguredIPFamily(t *testing.T) {
+	server := &Server{config: config.Config{Port: 0, BindAddress: "127.0.0.1"}}
+	listeners, err := server.listenAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, listener := range listeners {
+		t.Cleanup(func() { _ = listener.Close() })
+	}
+	if len(listeners) != 1 {
+		t.Fatalf("listenAll() returned %d listeners, want 1", len(listeners))
+	}
+	if got := listeners[0].Addr().(*net.TCPAddr).IP.To4(); got == nil {
+		t.Fatalf("listener address = %v, want IPv4", listeners[0].Addr())
+	}
+}
+
 func testServer() *Server {
 	return &Server{logger: slog.New(slog.DiscardHandler)}
 }

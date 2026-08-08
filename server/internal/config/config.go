@@ -1,8 +1,6 @@
 package config
 
 import (
-	"bytes"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,6 +37,7 @@ type Config struct {
 	Schema           string       `json:"$schema,omitempty"`
 	HostKeyFile      string       `json:"hostKeyFile"`
 	Port             int          `json:"port"`
+	BindAddress      string       `json:"bindAddress,omitempty"`
 	UploadStagingDir string       `json:"uploadStagingDir"`
 	LoginGraceMs     *Millis      `json:"loginGraceMs,omitempty"`
 	AuthBackend      *AuthBackend `json:"authBackend,omitempty"`
@@ -97,7 +97,7 @@ func (u User) ClientAlive() (interval time.Duration, countMax int) {
 
 type RootFS struct {
 	Backend        string   `json:"backend,omitempty"`
-	AllowedMethods []string `json:"allowed_methods,omitempty"`
+	AllowedMethods []string `json:"allowedMethods,omitempty"`
 	Children       []Entry  `json:"children,omitempty"`
 }
 
@@ -116,7 +116,7 @@ type Entry struct {
 	Directory            string   `json:"directory,omitempty"`
 	File                 string   `json:"file,omitempty"`
 	Backend              string   `json:"backend,omitempty"`
-	AllowedMethods       []string `json:"allowed_methods,omitempty"`
+	AllowedMethods       []string `json:"allowedMethods,omitempty"`
 	Size                 int64    `json:"size,omitempty"`
 	Children             []Entry  `json:"children,omitempty"`
 	MaxUploadSize        int64    `json:"maxUploadSize,omitempty"`
@@ -124,12 +124,13 @@ type Entry struct {
 }
 
 func Load(path string) (Config, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read configuration: %w", err)
 	}
+	defer file.Close()
 
-	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 
 	var cfg Config
@@ -306,7 +307,7 @@ func (e Entry) Name() string {
 
 func (c Config) StaticUser(username string) (User, bool) {
 	for _, user := range c.Users {
-		if subtle.ConstantTimeCompare([]byte(user.Username), []byte(username)) == 1 {
+		if user.Username == username {
 			return user, true
 		}
 	}
@@ -316,30 +317,32 @@ func (c Config) StaticUser(username string) (User, bool) {
 func (u User) HasAuthorizedKey(key ssh.PublicKey) bool {
 	for _, encodedKey := range u.AuthorizedKeys {
 		candidate, _, _, _, err := ssh.ParseAuthorizedKey([]byte(encodedKey))
-		if err == nil && subtle.ConstantTimeCompare(candidate.Marshal(), key.Marshal()) == 1 {
+		if err == nil && string(candidate.Marshal()) == string(key.Marshal()) {
 			return true
 		}
 	}
 	return false
 }
 
-// validateMethods checks allowed_methods for a node served by backend.
+// supportedMethods is every HTTP method the proxy knows how to send to a
+// backend, and so the only values allowedMethods may name.
+var supportedMethods = []string{"GET", "POST", "DELETE"}
+
+// validateMethods checks allowedMethods for a node served by backend.
 // The list constrains the requests the proxy will send to that backend, so it
 // is meaningless — and therefore rejected rather than silently ignored — on a
 // node that has no backend to send them to.
 func validateMethods(methods []string, backend string) error {
 	if len(methods) != 0 && backend == "" {
-		return errors.New("allowed_methods requires a backend")
+		return errors.New("allowedMethods requires a backend")
 	}
-	seen := make(map[string]struct{}, len(methods))
-	for _, method := range methods {
-		if method != "GET" && method != "POST" && method != "DELETE" {
+	for index, method := range methods {
+		if !slices.Contains(supportedMethods, method) {
 			return fmt.Errorf("unsupported allowed method %q", method)
 		}
-		if _, exists := seen[method]; exists {
+		if slices.Contains(methods[:index], method) {
 			return fmt.Errorf("duplicate allowed method %q", method)
 		}
-		seen[method] = struct{}{}
 	}
 	return nil
 }

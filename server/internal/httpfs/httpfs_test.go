@@ -95,7 +95,7 @@ func TestListPresentsAnUnlistableDirectoryAsEmpty(t *testing.T) {
 	}
 
 	// Declaring the directory upload-only keeps the request from being made
-	// at all, which is what allowed_methods is for.
+	// at all, which is what allowedMethods is for.
 	node.AllowedMethods = []string{http.MethodPost}
 	children, err = backend.List(context.Background(), node)
 	if err != nil || len(children) != 0 {

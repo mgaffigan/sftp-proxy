@@ -15,7 +15,7 @@ app.post("/auth", async (context) => {
     user: {
       rootfs: {
         children: [
-          { directory: "Inbound", backend: `${origin}/upload`, allowed_methods: ["POST"] },
+          { directory: "Inbound", backend: `${origin}/upload`, allowedMethods: ["POST"] },
           {
             directory: "Outbound",
             children: [{ file: "seed.txt", backend: `${origin}/download/seed.txt` }]

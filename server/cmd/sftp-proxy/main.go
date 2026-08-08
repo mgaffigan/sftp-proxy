@@ -21,9 +21,9 @@ const passwordHashCost = 12
 
 func main() {
 	configPath := flag.String("config", "sftp-proxy.json", "path to JSON configuration")
-	hashPassword := flag.Bool("hash-password", false, "prompt for a password and print its bcrypt hash")
+	hashPasswordFlag := flag.Bool("hash-password", false, "prompt for a password and print its bcrypt hash")
 	flag.Parse()
-	if *hashPassword {
+	if *hashPasswordFlag {
 		if err := printPasswordHash(); err != nil {
 			slog.Error("generate password hash", "error", err)
 			os.Exit(1)

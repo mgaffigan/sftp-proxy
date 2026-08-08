@@ -38,7 +38,7 @@ type WriterAtCloser interface {
 // entirely different backend.
 //
 // Every method takes the whole node rather than its URL, because what a backend
-// may do with a node is the backend's own business: allowed_methods, for one,
+// may do with a node is the backend's own business: allowedMethods, for one,
 // constrains HTTP traffic and is read only by the HTTP backend.
 type Backend interface {
 	List(ctx context.Context, node Node) ([]Node, error)

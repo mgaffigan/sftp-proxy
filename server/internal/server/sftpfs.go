@@ -263,6 +263,14 @@ func (w *tracedWriter) Abort() error {
 	return err
 }
 
+// TransferError is how pkg/sftp reports a transfer that ended badly — a dropped
+// connection, a client that stopped — on the handle it is about to close. The
+// close alone says nothing of the failure, so without this the partial content
+// that arrived would be published as though it were the whole file.
+func (w *tracedWriter) TransferError(error) { _ = w.Abort() }
+
+var _ sftp.TransferError = (*tracedWriter)(nil)
+
 // statusError translates a filesystem outcome into the SFTP status a client
 // receives. Anything unrecognised becomes a generic failure: pkg/sftp puts a
 // bare error's text on the wire, so only these fixed values may reach it.

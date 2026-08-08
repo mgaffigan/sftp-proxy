@@ -731,7 +731,9 @@ func (b *memoryBackend) Remove(_ context.Context, node vfs.Node) error {
 	return nil
 }
 
-func (b *memoryBackend) Rename(context.Context, vfs.Node, string) error { return vfs.ErrUnsupported }
+func (b *memoryBackend) Rename(context.Context, vfs.Node, string, string) error {
+	return vfs.ErrUnsupported
+}
 
 func (b *memoryBackend) Child(node vfs.Node, name string) (vfs.Node, error) {
 	return vfs.Node{File: name, Backend: memoryURL(path.Join(memoryPath(node), name))}, nil

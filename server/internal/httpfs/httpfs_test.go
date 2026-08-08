@@ -128,7 +128,7 @@ func TestAllowedMethodsRefuseLocallyWithoutARequest(t *testing.T) {
 	if err := backend.Remove(ctx, readOnly); !errors.Is(err, vfs.ErrPermission) {
 		t.Errorf("Remove() error = %v, want permission denied", err)
 	}
-	if err := backend.Rename(ctx, readOnly, "/other.txt"); !errors.Is(err, vfs.ErrPermission) {
+	if err := backend.Rename(ctx, readOnly, "/f.txt", "/other.txt"); !errors.Is(err, vfs.ErrPermission) {
 		t.Errorf("Rename() error = %v, want permission denied", err)
 	}
 	if err := backend.Mkdir(ctx, readOnly); !errors.Is(err, vfs.ErrPermission) {
@@ -211,7 +211,7 @@ func TestRemoveAndRenameBothDelete(t *testing.T) {
 	}
 
 	// A rename is the same DELETE, carrying where the node should end up.
-	if err := backend.Rename(ctx, node, "/some dir/moved.txt"); err != nil {
+	if err := backend.Rename(ctx, node, "/f.txt", "/some dir/moved.txt"); err != nil {
 		t.Fatalf("Rename() error = %v", err)
 	}
 	if requested != "DELETE /f.txt?renameTo=%2Fsome+dir%2Fmoved.txt" {

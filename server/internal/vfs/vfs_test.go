@@ -112,8 +112,8 @@ func (m *mock) Remove(ctx context.Context, node Node) error {
 	return m.fail
 }
 
-func (m *mock) Rename(ctx context.Context, node Node, target string) error {
-	m.record("Rename %s -> %s", node.Backend, target)
+func (m *mock) Rename(ctx context.Context, node Node, from, to string) error {
+	m.record("Rename %s (%s) -> %s", node.Backend, from, to)
 	return m.fail
 }
 
@@ -305,7 +305,9 @@ func TestRenameForgetsTheWholeSubtreeItMoved(t *testing.T) {
 	if err := filesystem.Rename(ctx, "/a/b", "/a/moved"); err != nil {
 		t.Fatalf("Rename() error = %v", err)
 	}
-	if got := backend.count("Rename mock://root/a/b -> /a/moved"); got != 1 {
+	// The backend is told where the node was as well as where it goes: one that
+	// cannot resolve a virtual path has only the two to compare.
+	if got := backend.count("Rename mock://root/a/b (/a/b) -> /a/moved"); got != 1 {
 		t.Fatalf("rename call = %v", backend.log())
 	}
 

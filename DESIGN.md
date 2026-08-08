@@ -4,7 +4,7 @@ We're going to create a bulletproof SFTP to HTTP proxy that can serve as a front
 
 The first implementation is Go, using `golang.org/x/crypto/ssh` for SSH and
 `github.com/pkg/sftp` for SFTP. It supports SFTP and SCP over the same virtual
-filesystem. The initial virtual filesystem backend is HTTP. Local storage and
+filesystem, served by an HTTP backend and by a local filesystem backend.
 S3-compatible backends are deferred.
 
 The server uses a configured PEM host key and refuses to start if it cannot
@@ -91,7 +91,8 @@ reading, including OpenSSH, can transfer dynamic files correctly.
 
 Entries may include an RFC 3339 `mtime` and numeric POSIX `permissions` bits
 from `0` through `0777`. The proxy presents supplied values as SFTP metadata;
-omitted values retain the synthetic defaults.
+omitted values retain the synthetic defaults. On an HTTP entry that is all
+`permissions` does; the local filesystem backend also enforces them.
 
 Any entry, file or directory, may include `allowedMethods` with any of `GET`,
 `POST`, and `DELETE`. It states which requests the proxy may send to that
@@ -134,7 +135,9 @@ Rename is a `DELETE` to the source URL with a percent-encoded root-relative
 the source's `allowedMethods` alone. The proxy does not interpret the
 destination beyond validating the path: whether a rename to it is possible,
 including one that lands under a different backend, is the source backend's
-answer to give.
+answer to give. A backend is told where the source was as well as where it
+should end up, which is nothing an HTTP backend needs; it is there for one that
+must act on the destination itself and so must know what it is being asked.
 
 HTTP `403` maps to an SFTP permission error, `404` to no-such-file, `405` to
 operation-unsupported, and other non-success responses to a generic SFTP
@@ -146,6 +149,15 @@ clients: list, stat, read, create, write, delete, rename, mkdir, and rmdir.
 Permission, owner, group, and timestamp updates succeed as synthetic no-ops.
 Operations requiring durable link semantics are unsupported until a backend
 contract for them exists.
+
+### Local Filesystem Backend
+
+- **Paths**: Absolute local URLs only (no query, fragment, or remote host).
+- **Prefixes**: Enabled via allowedPrefixes (absolute, non-nested).
+- **Sandbox**: Locked to prefix; traversal (..) & symlink escapes blocked.
+- **Permissions**: Masked via 'permissions' prop; inherits down tree.
+- **Files**: Plain files/dirs only. Atomic uploads via temp renames.
+- **Errors**: OS details hidden; generic backend errors, traces logged.
 
 ### SCP
 
@@ -188,9 +200,11 @@ The proxy is layered so that each concern has one home. The server maps SFTP
 onto filesystem operations and knows nothing of backend URLs. The virtual
 filesystem owns paths, traversal, and which backend serves a node, and knows
 nothing of SFTP or of any storage protocol. A backend serves exactly one
-protocol and knows nothing of paths or traversal. Errors cross these boundaries
-as outcomes — not found, not permitted, not supported, failed — so that no
-backend URL or remote message can reach a client.
+protocol and knows nothing of virtual paths or of traversal within them — a
+backend whose protocol is the local filesystem still knows only where its own
+URLs lead. Errors cross these boundaries as outcomes — not found, not permitted,
+not supported, failed — so that no backend URL or remote message can reach a
+client.
 
 A node's backend URL scheme selects the backend serving it, which is what
 allows one filesystem to mix them: a directory listing returned over HTTP may

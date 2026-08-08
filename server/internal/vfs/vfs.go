@@ -205,7 +205,7 @@ func (f *FS) Rename(ctx context.Context, from, to string) error {
 	// they were, and the destination stops being whatever it was before.
 	f.forget(fromParts)
 	f.forget(toParts)
-	return backend.Rename(ctx, node, joinPath(toParts))
+	return backend.Rename(ctx, node, joinPath(fromParts), joinPath(toParts))
 }
 
 // newChild builds the node a create would bring into existence, by asking the

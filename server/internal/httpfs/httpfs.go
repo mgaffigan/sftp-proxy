@@ -111,7 +111,7 @@ func (b *Backend) Remove(ctx context.Context, node vfs.Node) error {
 // Rename is one DELETE on the source carrying where it should end up, so the
 // source's own methods are the whole decision. What the destination is, or
 // whether it can be reached at all, is the backend's answer to give.
-func (b *Backend) Rename(ctx context.Context, node vfs.Node, target string) error {
+func (b *Backend) Rename(ctx context.Context, node vfs.Node, _, target string) error {
 	if !permits(node, http.MethodDelete) {
 		return vfs.ErrPermission
 	}

@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 
 	"sftp-proxy/internal/config"
 	"sftp-proxy/internal/httpfs"
+	"sftp-proxy/internal/localfs"
 	"sftp-proxy/internal/vfs"
 )
 
@@ -134,7 +137,7 @@ func (testWriteBackend) Create(context.Context, vfs.Node) (vfs.WriterAtCloser, e
 func (testWriteBackend) Mkdir(context.Context, vfs.Node) error  { return vfs.ErrUnsupported }
 func (testWriteBackend) Remove(context.Context, vfs.Node) error { return vfs.ErrUnsupported }
 
-func (testWriteBackend) Rename(context.Context, vfs.Node, string) error {
+func (testWriteBackend) Rename(context.Context, vfs.Node, string, string) error {
 	return vfs.ErrUnsupported
 }
 
@@ -248,4 +251,165 @@ func spanNames(spans []trace.ReadOnlySpan) []string {
 		names = append(names, span.Name())
 	}
 	return names
+}
+
+// TestSFTPServesLocalFiles drives the local backend the way a client does: the
+// SFTP surface, the virtual filesystem, and real files on disk, with nothing
+// stubbed in between.
+func TestSFTPServesLocalFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "seed.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	local, err := localfs.New([]string{root})
+	if err != nil {
+		t.Fatalf("localfs.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = local.Close() })
+
+	filesystem := vfs.New(config.RootFS{Children: []config.Entry{{
+		Directory: "Files",
+		Backend:   (&url.URL{Scheme: config.FileScheme, Path: root}).String(),
+	}}}, vfs.Backends{config.FileScheme: local})
+	adapter := newHandlerFactory(filesystem, 0).handlers(context.Background()).FileGet.(*sftpFS)
+
+	entries := listing(t, adapter, "/Files")
+	if len(entries) != 1 || entries[0].Name() != "seed.txt" || entries[0].Size() != 5 {
+		t.Fatalf("listing = %v", entries)
+	}
+	if entries[0].Mode().Perm() != 0o644 {
+		t.Errorf("mode = %v, want the file's own permissions", entries[0].Mode())
+	}
+
+	reader, err := adapter.Fileread(sftp.NewRequest("Get", "/Files/seed.txt"))
+	if err != nil {
+		t.Fatalf("Fileread() error = %v", err)
+	}
+	contents := make([]byte, 5)
+	if _, err := reader.ReadAt(contents, 0); err != nil || string(contents) != "hello" {
+		t.Fatalf("ReadAt() = (%q, %v)", contents, err)
+	}
+	if err := reader.(io.Closer).Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	writer, err := adapter.Filewrite(sftp.NewRequest("Put", "/Files/upload.txt"))
+	if err != nil {
+		t.Fatalf("Filewrite() error = %v", err)
+	}
+	if _, err := writer.WriteAt([]byte("uploaded"), 0); err != nil {
+		t.Fatalf("WriteAt() error = %v", err)
+	}
+	if err := writer.(io.Closer).Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(root, "upload.txt")); err != nil || string(contents) != "uploaded" {
+		t.Fatalf("upload.txt = (%q, %v)", contents, err)
+	}
+
+	if err := adapter.Filecmd(sftp.NewRequest("Mkdir", "/Files/Archive")); err != nil {
+		t.Fatalf("Mkdir error = %v", err)
+	}
+
+	// A client that uploads under a temporary name and renames it into place,
+	// which is what the rename this backend supports is for.
+	rename := sftp.NewRequest("Rename", "/Files/upload.txt")
+	rename.Target = "/Files/report.txt"
+	if err := adapter.Filecmd(rename); err != nil {
+		t.Fatalf("Rename error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "report.txt")); err != nil {
+		t.Fatalf("report.txt = %v", err)
+	}
+
+	// Somewhere else is somewhere this backend cannot place it.
+	elsewhere := sftp.NewRequest("Rename", "/Files/report.txt")
+	elsewhere.Target = "/Files/Archive/report.txt"
+	if err := adapter.Filecmd(elsewhere); !errors.Is(err, sftp.ErrSSHFxOpUnsupported) {
+		t.Fatalf("Rename into another directory = %v, want op unsupported", err)
+	}
+
+	if err := adapter.Filecmd(sftp.NewRequest("Remove", "/Files/report.txt")); err != nil {
+		t.Fatalf("Remove error = %v", err)
+	}
+	if err := adapter.Filecmd(sftp.NewRequest("Rmdir", "/Files/Archive")); err != nil {
+		t.Fatalf("Rmdir error = %v", err)
+	}
+	entries = listing(t, adapter, "/Files")
+	if len(entries) != 1 || entries[0].Name() != "seed.txt" {
+		t.Fatalf("listing after removal = %v", entries)
+	}
+
+	// A link out of the allowed directory is not offered to a client, and naming
+	// it anyway reaches nothing.
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("not yours"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if entries := listing(t, adapter, "/Files"); len(entries) != 1 || entries[0].Name() != "seed.txt" {
+		t.Fatalf("listing with a link present = %v", entries)
+	}
+	if _, err := adapter.Fileread(sftp.NewRequest("Get", "/Files/escape/secret.txt")); !errors.Is(err, sftp.ErrSSHFxNoSuchFile) {
+		t.Fatalf("read through a link out of the allowed directory = %v, want no such file", err)
+	}
+}
+
+func listing(t *testing.T, adapter *sftpFS, path string) []os.FileInfo {
+	t.Helper()
+	lister, err := adapter.Filelist(sftp.NewRequest("List", path))
+	if err != nil {
+		t.Fatalf("Filelist(%q) error = %v", path, err)
+	}
+	entries := make([]os.FileInfo, 8)
+	count, err := lister.ListAt(entries, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ListAt() error = %v", err)
+	}
+	return entries[:count]
+}
+
+// TestAnInterruptedTransferDiscardsTheUpload covers what a dropped connection
+// looks like from here: pkg/sftp reports the failure on the handle and then
+// closes it, and a close on its own would publish whatever had arrived.
+func TestAnInterruptedTransferDiscardsTheUpload(t *testing.T) {
+	root := t.TempDir()
+	local, err := localfs.New([]string{root})
+	if err != nil {
+		t.Fatalf("localfs.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = local.Close() })
+
+	filesystem := vfs.New(config.RootFS{
+		Backend: (&url.URL{Scheme: config.FileScheme, Path: root}).String(),
+	}, vfs.Backends{config.FileScheme: local})
+	adapter := newHandlerFactory(filesystem, 0).handlers(context.Background()).FilePut.(*sftpFS)
+
+	writer, err := adapter.Filewrite(sftp.NewRequest("Put", "/half.txt"))
+	if err != nil {
+		t.Fatalf("Filewrite() error = %v", err)
+	}
+	if _, err := writer.WriteAt([]byte("half a file"), 0); err != nil {
+		t.Fatalf("WriteAt() error = %v", err)
+	}
+
+	failed, ok := writer.(sftp.TransferError)
+	if !ok {
+		t.Fatalf("writer %T does not report a transfer error", writer)
+	}
+	failed.TransferError(io.ErrUnexpectedEOF)
+	// The close pkg/sftp makes next must not undo that.
+	if err := writer.(io.Closer).Close(); err == nil {
+		t.Error("Close() after a failed transfer reported success")
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("%s contains %d entries, want the upload discarded", root, len(entries))
+	}
 }

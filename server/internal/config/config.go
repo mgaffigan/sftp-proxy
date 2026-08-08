@@ -41,6 +41,7 @@ type Config struct {
 	UploadStagingDir string       `json:"uploadStagingDir"`
 	LoginGraceMs     *Millis      `json:"loginGraceMs,omitempty"`
 	AuthBackend      *AuthBackend `json:"authBackend,omitempty"`
+	FileBackend      *FileBackend `json:"fileBackend,omitempty"`
 	Users            []User       `json:"users,omitempty"`
 }
 
@@ -48,6 +49,13 @@ type AuthBackend struct {
 	BaseURL   string  `json:"baseURL"`
 	URL       string  `json:"url,omitempty"`
 	TimeoutMs *Millis `json:"timeoutMs,omitempty"`
+}
+
+// FileBackend is a deployment's consent to serve local files. Its absence
+// withholds the file scheme entirely, so a file:// entry cannot be reached
+// however a configuration or a backend listing names it.
+type FileBackend struct {
+	AllowedPrefixes []string `json:"allowedPrefixes"`
 }
 
 type User struct {
@@ -103,6 +111,7 @@ func (u User) UploadConcurrencyLimit() int {
 type RootFS struct {
 	Backend        string   `json:"backend,omitempty"`
 	AllowedMethods []string `json:"allowedMethods,omitempty"`
+	Permissions    *uint32  `json:"permissions,omitempty"`
 	Children       []Entry  `json:"children,omitempty"`
 	MaxUploadSize  int64    `json:"maxUploadSize,omitempty"`
 }
@@ -114,6 +123,7 @@ func (r RootFS) Entry() Entry {
 		Directory:      "/",
 		Backend:        r.Backend,
 		AllowedMethods: r.AllowedMethods,
+		Permissions:    r.Permissions,
 		Children:       r.Children,
 		MaxUploadSize:  r.MaxUploadSize,
 	}
@@ -180,6 +190,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("authBackend: %w", err)
 		}
 	}
+	if c.FileBackend != nil {
+		if err := c.FileBackend.Validate(); err != nil {
+			return fmt.Errorf("fileBackend: %w", err)
+		}
+	}
 	if len(c.Users) == 0 && c.AuthBackend == nil {
 		return errors.New("configure at least one user or authBackend")
 	}
@@ -189,12 +204,97 @@ func (c Config) Validate() error {
 		if err := user.Validate(); err != nil {
 			return fmt.Errorf("users[%d]: %w", index, err)
 		}
+		if err := c.validateLocalPaths(user.RootFS); err != nil {
+			return fmt.Errorf("users[%d]: %w", index, err)
+		}
 		if _, exists := seenUsers[user.Username]; exists {
 			return fmt.Errorf("duplicate username %q", user.Username)
 		}
 		seenUsers[user.Username] = struct{}{}
 	}
 	return nil
+}
+
+func (f FileBackend) Validate() error {
+	if len(f.AllowedPrefixes) == 0 {
+		return errors.New("allowedPrefixes requires at least one directory")
+	}
+	for index, prefix := range f.AllowedPrefixes {
+		if !filepath.IsAbs(prefix) || filepath.Clean(prefix) != prefix {
+			return fmt.Errorf("allowedPrefixes[%d]: %q must be an absolute, cleaned path", index, prefix)
+		}
+		// A path lying under two prefixes would be served through whichever was
+		// found first, and which prefix serves it decides how far a symlink
+		// inside it may reach. Overlap is rejected so that is never a question.
+		for _, other := range f.AllowedPrefixes[:index] {
+			if _, inside := Relative(other, prefix); inside {
+				return fmt.Errorf("allowedPrefixes[%d]: %q overlaps %q", index, prefix, other)
+			}
+			if _, inside := Relative(prefix, other); inside {
+				return fmt.Errorf("allowedPrefixes[%d]: %q overlaps %q", index, prefix, other)
+			}
+		}
+	}
+	return nil
+}
+
+// Relative reports where path lies within prefix, and whether it lies there at
+// all: it may be prefix itself or anything beneath it. Components are compared
+// whole, so /srv/data does not contain /srv/database, and a path that climbs
+// back out is not inside. Both must be absolute and cleaned.
+//
+// This is the one definition of that question. What may be served rests on it,
+// so a second one that disagreed would be a way in.
+func Relative(prefix, path string) (string, bool) {
+	relative, err := filepath.Rel(prefix, path)
+	if err != nil || relative != "." && !filepath.IsLocal(relative) {
+		return "", false
+	}
+	return relative, true
+}
+
+// validateLocalPaths refuses at startup what the file backend would refuse at
+// request time: a local path this deployment has not consented to serve. Only a
+// statically configured tree can be checked here — one a user's authentication
+// backend supplies arrives too late — so the backend enforces this again itself.
+func (c Config) validateLocalPaths(root RootFS) error {
+	var walk func(entry Entry) error
+	walk = func(entry Entry) error {
+		if err := c.validateLocalBackend(entry.Backend); err != nil {
+			return fmt.Errorf("%s: %w", entry.Name(), err)
+		}
+		for _, child := range entry.Children {
+			if err := walk(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := c.validateLocalBackend(root.Backend); err != nil {
+		return fmt.Errorf("rootfs: %w", err)
+	}
+	for _, child := range root.Children {
+		if err := walk(child); err != nil {
+			return fmt.Errorf("rootfs: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c Config) validateLocalBackend(rawURL string) error {
+	path, ok := LocalPath(rawURL)
+	if !ok {
+		return nil
+	}
+	if c.FileBackend == nil {
+		return errors.New("a file backend URL requires fileBackend.allowedPrefixes")
+	}
+	for _, prefix := range c.FileBackend.AllowedPrefixes {
+		if _, inside := Relative(prefix, path); inside {
+			return nil
+		}
+	}
+	return fmt.Errorf("%q lies outside every fileBackend.allowedPrefixes entry", path)
 }
 
 func (a AuthBackend) Validate() error {
@@ -348,10 +448,17 @@ var supportedMethods = []string{"GET", "POST", "DELETE"}
 // validateMethods checks allowedMethods for a node served by backend.
 // The list constrains the requests the proxy will send to that backend, so it
 // is meaningless — and therefore rejected rather than silently ignored — on a
-// node that has no backend to send them to.
+// node that has no backend to send them to, or on one served locally, where
+// there is no request to withhold and permissions is the equivalent lever.
 func validateMethods(methods []string, backend string) error {
-	if len(methods) != 0 && backend == "" {
+	if len(methods) == 0 {
+		return nil
+	}
+	if backend == "" {
 		return errors.New("allowedMethods requires a backend")
+	}
+	if _, local := LocalPath(backend); local {
+		return errors.New("allowedMethods does not apply to a file backend; use permissions")
 	}
 	for index, method := range methods {
 		if !slices.Contains(supportedMethods, method) {
@@ -372,16 +479,57 @@ func ValidName(name string) bool {
 	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, "/\\\x00") && filepath.Base(name) == name
 }
 
+// FileScheme names the backend serving local files. A node's URL scheme selects
+// its backend, so this is also the string a deployment withholds by leaving
+// fileBackend out of its configuration.
+const FileScheme = "file"
+
 func validateBackendURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	if err != nil || parsed.Scheme == "" {
 		return fmt.Errorf("invalid backend URL %q", rawURL)
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("backend URL must use http or https, got %q", parsed.Scheme)
-	}
 	if parsed.User != nil || parsed.Fragment != "" {
-		return fmt.Errorf("backend URL must not contain credentials or a fragment")
+		return errors.New("backend URL must not contain credentials or a fragment")
 	}
-	return nil
+	switch parsed.Scheme {
+	case "http", "https":
+		if parsed.Host == "" {
+			return fmt.Errorf("invalid backend URL %q", rawURL)
+		}
+		return nil
+	case FileScheme:
+		if _, ok := LocalPath(rawURL); !ok {
+			return fmt.Errorf("file backend URL must name a local absolute path and nothing else, got %q", rawURL)
+		}
+		return nil
+	default:
+		return fmt.Errorf("backend URL must use http, https, or file, got %q", parsed.Scheme)
+	}
+}
+
+// LocalPath reports the filesystem path a file backend URL names, and whether
+// the URL is one at all. It is the single definition of what file:// means to
+// this proxy: an absolute path on this host, with nothing else attached.
+//
+// The path is cleaned but otherwise unexamined. Whether it may be served, and
+// whether following it stays where it should, is settled where the operation
+// happens rather than by inspecting the string.
+func LocalPath(rawURL string) (string, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != FileScheme {
+		return "", false
+	}
+	// RFC 8089 lets the local host be named or left out; anything else names a
+	// host this backend cannot reach.
+	if parsed.Host != "" && parsed.Host != "localhost" {
+		return "", false
+	}
+	if parsed.Opaque != "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawQuery != "" || parsed.ForceQuery {
+		return "", false
+	}
+	if !strings.HasPrefix(parsed.Path, "/") {
+		return "", false
+	}
+	return filepath.Clean(filepath.FromSlash(parsed.Path)), true
 }

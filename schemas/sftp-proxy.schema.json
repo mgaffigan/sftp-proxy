@@ -42,6 +42,7 @@
       "description": "Milliseconds a connection may take to authenticate before it is disconnected, as in sshd_config LoginGraceTime. 0 means no limit."
     },
     "authBackend": { "$ref": "#/$defs/authBackend" },
+    "fileBackend": { "$ref": "#/$defs/fileBackend" },
     "users": {
       "type": "array",
       "items": { "$ref": "#/$defs/user" }
@@ -71,6 +72,20 @@
           "minimum": 0,
           "default": 30000,
           "description": "Milliseconds one HTTP request to the authentication backend may take. 0 means no limit."
+        }
+      }
+    },
+    "fileBackend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowedPrefixes"],
+      "description": "Consent to serve local files. Without this property no file:// backend URL can be reached, whether it is configured or returned by a backend listing.",
+      "properties": {
+        "allowedPrefixes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^/" },
+          "description": "Absolute, cleaned directories that may be served. Nothing outside them is reachable, and no prefix may contain another. Each must exist at startup."
         }
       }
     },
@@ -126,8 +141,9 @@
         }
       ],
       "properties": {
-        "backend": { "type": "string", "format": "uri" },
+        "backend": { "$ref": "#/$defs/backend" },
         "allowedMethods": { "$ref": "#/$defs/allowedMethods" },
+        "permissions": { "$ref": "#/$defs/permissions" },
         "maxUploadSize": {
           "type": "integer",
           "minimum": 0,
@@ -173,7 +189,7 @@
       "properties": {
         "directory": { "$ref": "#/$defs/name" },
         "file": { "$ref": "#/$defs/name" },
-        "backend": { "type": "string", "format": "uri" },
+        "backend": { "$ref": "#/$defs/backend" },
         "allowedMethods": { "$ref": "#/$defs/allowedMethods" },
         "size": { "type": "integer", "minimum": 0 },
         "mtime": {
@@ -181,12 +197,7 @@
           "format": "date-time",
           "description": "Optional RFC 3339 modification time presented to SFTP clients."
         },
-        "permissions": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 511,
-          "description": "Optional POSIX permission bits presented to SFTP clients."
-        },
+        "permissions": { "$ref": "#/$defs/permissions" },
         "children": {
           "type": "array",
           "items": { "$ref": "#/$defs/entry" }
@@ -203,11 +214,22 @@
       "minLength": 1,
       "pattern": "^(?!\\.{1,2}$)[^/\\\\\\u0000]+$"
     },
+    "backend": {
+      "type": "string",
+      "format": "uri",
+      "description": "Where this node is served from: an http:// or https:// base URL, or a file:// URL naming an absolute local path beneath a fileBackend.allowedPrefixes entry."
+    },
+    "permissions": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 511,
+      "description": "POSIX permission bits presented to SFTP clients. On a file:// node they are also enforced, as a mask over the permissions the filesystem itself reports: a read bit permits reading and listing, a write bit permits every change, and the mask is inherited by everything beneath the node. A mask can only take permission away."
+    },
     "allowedMethods": {
       "type": "array",
       "uniqueItems": true,
       "items": { "enum": ["GET", "POST", "DELETE"] },
-      "description": "HTTP methods the proxy may send to this node's backend. Applies to that node alone and is never inherited by or from another. Requires a backend, since it constrains requests to one. An omitted value allows all supported methods."
+      "description": "HTTP methods the proxy may send to this node's backend. Applies to that node alone and is never inherited by or from another. Requires an http:// or https:// backend, since it constrains requests to one; on a file:// node use permissions instead. An omitted value allows all supported methods."
     }
   }
 }

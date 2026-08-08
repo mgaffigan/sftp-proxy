@@ -21,6 +21,7 @@ import (
 	"sftp-proxy/internal/auth"
 	"sftp-proxy/internal/config"
 	"sftp-proxy/internal/httpfs"
+	"sftp-proxy/internal/localfs"
 	"sftp-proxy/internal/telemetry"
 	"sftp-proxy/internal/vfs"
 )
@@ -29,6 +30,7 @@ type Server struct {
 	config config.Config
 	signer ssh.Signer
 	auth   *auth.Authenticator
+	local  *localfs.Backend
 	logger *slog.Logger
 }
 
@@ -49,6 +51,11 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	server := &Server{config: cfg, signer: signer, auth: auth.New(cfg), logger: logger}
+	if cfg.FileBackend != nil {
+		if server.local, err = localfs.New(cfg.FileBackend.AllowedPrefixes); err != nil {
+			return nil, fmt.Errorf("open file backend: %w", err)
+		}
+	}
 	if err := os.MkdirAll(cfg.UploadStagingDir, 0700); err != nil {
 		return nil, fmt.Errorf("create upload staging directory: %w", err)
 	}
@@ -236,10 +243,17 @@ func connectionAttributes(address net.Addr) []attribute.KeyValue {
 // whether it was configured or arrived in a backend's directory listing.
 func (s *Server) filesystem(session auth.Session) *vfs.FS {
 	overHTTP := httpfs.New(session.Client, s.config.UploadStagingDir)
-	return vfs.New(session.User.RootFS, vfs.Backends{
+	backends := vfs.Backends{
 		"http":  overHTTP,
 		"https": overHTTP,
-	})
+	}
+	// The local backend holds the directories a deployment consented to serve,
+	// which belong to the process rather than to one connection: it has no
+	// cookie jar to carry and no per-session state at all.
+	if s.local != nil {
+		backends[config.FileScheme] = s.local
+	}
+	return vfs.New(session.User.RootFS, backends)
 }
 
 // clientAlive implements the user's clientAliveMs and clientAliveCountMax:

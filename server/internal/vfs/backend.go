@@ -50,9 +50,8 @@ type Backend interface {
 	Create(ctx context.Context, node Node) (WriterAtCloser, error)
 	Mkdir(ctx context.Context, node Node) error
 	Remove(ctx context.Context, node Node) error
-	// Rename moves node to target, a cleaned root-relative virtual path. The
-	// backend decides whether it can, including when target lies outside it.
-	Rename(ctx context.Context, node Node, target string) error
+	// Rename moves node from one virtual path to another.
+	Rename(ctx context.Context, node Node, from, to string) error
 	// Child names a member of a directory node, whether or not it exists yet,
 	// so that a create has somewhere to write to. It copies any directory
 	// policy that governs creation into the returned node.

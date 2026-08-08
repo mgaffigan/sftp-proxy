@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/term"
 
 	"sftp-proxy/internal/config"
 	"sftp-proxy/internal/server"
+	"sftp-proxy/internal/telemetry"
 )
 
 const passwordHashCost = 12
@@ -37,15 +39,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	tracing, err := telemetry.New(context.Background())
+	if err != nil {
+		slog.Error("initialize telemetry", "error", err)
+		os.Exit(1)
+	}
+	shutdownTelemetry := func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracing.Shutdown(shutdownCtx); err != nil {
+			slog.Error("shutdown telemetry", "error", err)
+		}
+	}
+
 	proxy, err := server.New(cfg, slog.Default())
 	if err != nil {
 		slog.Error("initialize server", "error", err)
+		shutdownTelemetry()
 		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := proxy.ListenAndServe(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	err = proxy.ListenAndServe(ctx)
+	shutdownTelemetry()
+	if err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("serve", "error", err)
 		os.Exit(1)
 	}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -8,7 +9,11 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
+	"sftp-proxy/internal/telemetry"
 	"sftp-proxy/internal/vfs"
 )
 
@@ -16,6 +21,12 @@ import (
 // place that knows about the SFTP protocol; everything below it deals in paths
 // and nodes.
 type sftpFS struct {
+	fs         *vfs.FS
+	uploads    chan struct{}
+	sessionCtx context.Context
+}
+
+type handlerFactory struct {
 	fs      *vfs.FS
 	uploads chan struct{}
 }
@@ -33,83 +44,193 @@ func (w *uploadWriter) Close() error {
 }
 
 func handlers(filesystem *vfs.FS, maxConcurrentUploads int) sftp.Handlers {
-	adapter := &sftpFS{fs: filesystem}
+	return newHandlerFactory(filesystem, maxConcurrentUploads).handlers(context.Background())
+}
+
+func newHandlerFactory(filesystem *vfs.FS, maxConcurrentUploads int) *handlerFactory {
+	factory := &handlerFactory{fs: filesystem}
 	if maxConcurrentUploads > 0 {
-		adapter.uploads = make(chan struct{}, maxConcurrentUploads)
+		factory.uploads = make(chan struct{}, maxConcurrentUploads)
 	}
+	return factory
+}
+
+func (f *handlerFactory) handlers(sessionCtx context.Context) sftp.Handlers {
+	adapter := &sftpFS{fs: f.fs, uploads: f.uploads, sessionCtx: sessionCtx}
 	return sftp.Handlers{FileGet: adapter, FilePut: adapter, FileCmd: adapter, FileList: adapter}
 }
 
 func (s *sftpFS) Fileread(request *sftp.Request) (io.ReaderAt, error) {
-	reader, err := s.fs.Open(request.Context(), request.Filepath)
+	ctx, finish := s.startOperation(request, "read")
+	reader, err := s.fs.Open(ctx, request.Filepath)
 	if err != nil {
+		finish(err)
 		return nil, statusError(err)
 	}
-	return reader, nil
+	return &tracedReader{ReaderAtCloser: reader, span: trace.SpanFromContext(ctx), finish: finish}, nil
 }
 
 func (s *sftpFS) Filewrite(request *sftp.Request) (io.WriterAt, error) {
+	ctx, finish := s.startOperation(request, "write")
 	if s.uploads == nil {
-		writer, err := s.fs.Create(request.Context(), request.Filepath)
+		writer, err := s.fs.Create(ctx, request.Filepath)
 		if err != nil {
+			finish(err)
 			return nil, statusError(err)
 		}
-		return writer, nil
+		return &tracedWriter{WriterAtCloser: writer, span: trace.SpanFromContext(ctx), finish: finish}, nil
 	}
 
 	select {
 	case s.uploads <- struct{}{}:
 	default:
+		finish(vfs.ErrFailure)
 		return nil, statusError(vfs.ErrFailure)
 	}
-	writer, err := s.fs.Create(request.Context(), request.Filepath)
+	writer, err := s.fs.Create(ctx, request.Filepath)
 	if err != nil {
 		<-s.uploads
+		finish(err)
 		return nil, statusError(err)
 	}
-	return &uploadWriter{WriterAtCloser: writer, release: func() { <-s.uploads }}, nil
+	return &tracedWriter{
+		WriterAtCloser: &uploadWriter{WriterAtCloser: writer, release: func() { <-s.uploads }},
+		span:           trace.SpanFromContext(ctx),
+		finish:         finish,
+	}, nil
 }
 
 func (s *sftpFS) Filecmd(request *sftp.Request) error {
-	ctx := request.Context()
+	operation := map[string]string{
+		"Setstat": "setstat",
+		"Mkdir":   "mkdir",
+		"Remove":  "remove",
+		"Rmdir":   "remove",
+		"Rename":  "rename",
+	}[request.Method]
+	if operation == "" {
+		return sftp.ErrSSHFxOpUnsupported
+	}
+	ctx, finish := s.startOperation(request, operation)
+	var err error
 	switch request.Method {
 	case "Setstat":
 		// Permission, owner, and timestamp updates succeed as no-ops, but only
 		// for a path that exists.
-		_, err := s.fs.Stat(ctx, request.Filepath)
-		return statusError(err)
+		_, err = s.fs.Stat(ctx, request.Filepath)
 	case "Mkdir":
-		return statusError(s.fs.Mkdir(ctx, request.Filepath))
+		err = s.fs.Mkdir(ctx, request.Filepath)
 	case "Remove", "Rmdir":
-		return statusError(s.fs.Remove(ctx, request.Filepath))
+		err = s.fs.Remove(ctx, request.Filepath)
 	case "Rename":
-		return statusError(s.fs.Rename(ctx, request.Filepath, request.Target))
-	default:
-		return sftp.ErrSSHFxOpUnsupported
+		err = s.fs.Rename(ctx, request.Filepath, request.Target)
 	}
+	finish(err)
+	return statusError(err)
 }
 
 func (s *sftpFS) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
+	operation := map[string]string{"Stat": "stat", "List": "list"}[request.Method]
+	if operation == "" {
+		return nil, sftp.ErrSSHFxOpUnsupported
+	}
+	ctx, finish := s.startOperation(request, operation)
 	switch request.Method {
 	case "Stat":
-		node, err := s.fs.Stat(request.Context(), request.Filepath)
+		node, err := s.fs.Stat(ctx, request.Filepath)
 		if err != nil {
+			finish(err)
 			return nil, statusError(err)
 		}
+		finish(nil)
 		return lister{entries: []os.FileInfo{fileInfoFor(node)}}, nil
 	case "List":
-		children, err := s.fs.List(request.Context(), request.Filepath)
+		children, err := s.fs.List(ctx, request.Filepath)
 		if err != nil {
+			finish(err)
 			return nil, statusError(err)
 		}
 		entries := make([]os.FileInfo, 0, len(children))
 		for _, child := range children {
 			entries = append(entries, fileInfoFor(child))
 		}
+		finish(nil)
 		return lister{entries: entries}, nil
-	default:
-		return nil, sftp.ErrSSHFxOpUnsupported
 	}
+	return nil, sftp.ErrSSHFxOpUnsupported
+}
+
+func (s *sftpFS) startOperation(request *sftp.Request, operation string) (context.Context, func(error)) {
+	parent := s.sessionCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(request.Context(), cancel)
+	ctx, span := telemetry.Tracer().Start(ctx, "sftp."+operation,
+		trace.WithAttributes(attribute.String("sftp.operation", operation)))
+	var once sync.Once
+	return ctx, func(err error) {
+		once.Do(func() {
+			recordOperationError(span, err)
+			span.End()
+			stop()
+			cancel()
+		})
+	}
+}
+
+func recordOperationError(span trace.Span, err error) {
+	if err == nil || errors.Is(err, io.EOF) {
+		return
+	}
+	classification := "failure"
+	switch {
+	case errors.Is(err, vfs.ErrNotExist):
+		classification = "not_found"
+	case errors.Is(err, vfs.ErrPermission):
+		classification = "permission"
+	case errors.Is(err, vfs.ErrUnsupported):
+		classification = "unsupported"
+	}
+	span.SetStatus(codes.Error, "SFTP operation failed")
+	span.SetAttributes(attribute.String("error.type", classification))
+}
+
+type tracedReader struct {
+	vfs.ReaderAtCloser
+	span   trace.Span
+	finish func(error)
+}
+
+func (r *tracedReader) ReadAt(destination []byte, offset int64) (int, error) {
+	count, err := r.ReaderAtCloser.ReadAt(destination, offset)
+	recordOperationError(r.span, err)
+	return count, err
+}
+
+func (r *tracedReader) Close() error {
+	err := r.ReaderAtCloser.Close()
+	r.finish(err)
+	return err
+}
+
+type tracedWriter struct {
+	vfs.WriterAtCloser
+	span   trace.Span
+	finish func(error)
+}
+
+func (w *tracedWriter) WriteAt(data []byte, offset int64) (int, error) {
+	count, err := w.WriterAtCloser.WriteAt(data, offset)
+	recordOperationError(w.span, err)
+	return count, err
+}
+
+func (w *tracedWriter) Close() error {
+	err := w.WriterAtCloser.Close()
+	w.finish(err)
+	return err
 }
 
 // statusError translates a filesystem outcome into the SFTP status a client

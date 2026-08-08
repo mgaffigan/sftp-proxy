@@ -44,3 +44,20 @@ repository root:
 ```
 
 Adjust the relative path when the configuration lives elsewhere.
+
+## Observability
+
+The proxy emits OpenTelemetry traces for SSH connections, authentication,
+SFTP sessions and operations, and outbound authentication and filesystem HTTP
+requests. With no OpenTelemetry exporter configured, completed spans are
+written to standard output.
+
+Use the standard OpenTelemetry environment variables to send traces to an
+OTLP/HTTP collector:
+
+```sh
+OTEL_TRACES_EXPORTER=otlp \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 \
+docker run --rm --user 0 -p 2222:2222 ... sftp-proxy
+```

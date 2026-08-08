@@ -4,13 +4,20 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/pkg/sftp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/httpfs"
 	"sftp-proxy/internal/vfs"
 )
 
@@ -158,4 +165,86 @@ func TestFilewriteLimitsConcurrentUploads(t *testing.T) {
 	if _, err := adapter.Filewrite(sftp.NewRequest("Put", "/second.txt")); err != nil {
 		t.Fatalf("second Filewrite() after Close error = %v", err)
 	}
+}
+
+func TestReadSpanContainsBackendRequestUntilClose(t *testing.T) {
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := trace.NewTracerProvider(trace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { _ = provider.Shutdown(t.Context()) })
+	previousProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() { otel.SetTracerProvider(previousProvider) })
+	tracer := provider.Tracer("test")
+
+	var traceparent string
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		traceparent = request.Header.Get("traceparent")
+		writer.Header().Set("Content-Length", "2")
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	filesystem := vfs.New(config.RootFS{Children: []config.Entry{{
+		File:    "report.txt",
+		Backend: backend.URL + "/report.txt",
+	}}}, vfs.Backends{"http": httpfs.New(backend.Client(), t.TempDir())})
+	connectionCtx, connectionSpan := tracer.Start(context.Background(), "ssh.connection")
+	sessionCtx, sessionSpan := tracer.Start(connectionCtx, "sftp.session")
+	adapter := newHandlerFactory(filesystem, 0).handlers(sessionCtx).FileGet.(*sftpFS)
+
+	reader, err := adapter.Fileread(sftp.NewRequest("Get", "/report.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := make([]byte, 2)
+	if count, err := reader.ReadAt(contents, 0); err != nil || count != len(contents) || string(contents) != "ok" {
+		t.Fatalf("ReadAt() = (%d, %v, %q), want (2, nil, ok)", count, err, contents)
+	}
+	if traceparent == "" {
+		t.Fatal("backend request has no traceparent header")
+	}
+	if spanNamed(recorder.Ended(), "sftp.read") != nil {
+		t.Fatal("sftp.read span ended before its reader closed")
+	}
+	if err := reader.(io.Closer).Close(); err != nil {
+		t.Fatal(err)
+	}
+	sessionSpan.End()
+	connectionSpan.End()
+
+	spans := recorder.Ended()
+	connection := spanNamed(spans, "ssh.connection")
+	session := spanNamed(spans, "sftp.session")
+	read := spanNamed(spans, "sftp.read")
+	request := spanNamed(spans, "HTTP GET")
+	if connection == nil || session == nil || read == nil || request == nil {
+		t.Fatalf("ended spans = %v, want connection, session, read, and HTTP request", spanNames(spans))
+	}
+	if session.Parent().SpanID() != connection.SpanContext().SpanID() ||
+		read.Parent().SpanID() != session.SpanContext().SpanID() ||
+		request.Parent().SpanID() != read.SpanContext().SpanID() {
+		t.Fatalf("span parentage = connection=%s session=%s read=%s request=%s", connection.Parent().SpanID(), session.Parent().SpanID(), read.Parent().SpanID(), request.Parent().SpanID())
+	}
+}
+
+func spanNamed(spans []trace.ReadOnlySpan, name string) trace.ReadOnlySpan {
+	for _, span := range spans {
+		if span.Name() == name {
+			return span
+		}
+	}
+	return nil
+}
+
+func spanNames(spans []trace.ReadOnlySpan) []string {
+	names := make([]string, 0, len(spans))
+	for _, span := range spans {
+		names = append(names, span.Name())
+	}
+	return names
 }

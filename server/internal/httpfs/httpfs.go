@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/telemetry"
 	"sftp-proxy/internal/vfs"
 )
 
@@ -33,7 +34,7 @@ type Backend struct {
 }
 
 func New(client *http.Client, stagingDir string) *Backend {
-	return &Backend{client: client, stagingDir: stagingDir}
+	return &Backend{client: telemetry.NewHTTPClient(client), stagingDir: stagingDir}
 }
 
 func (b *Backend) List(ctx context.Context, node vfs.Node) ([]vfs.Node, error) {
@@ -149,7 +150,7 @@ func (b *Backend) mutate(ctx context.Context, method, rawURL, contentType string
 }
 
 func (b *Backend) do(ctx context.Context, method, rawURL, contentType string, body io.Reader) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(ctx, method, rawURL, body)
+	request, err := http.NewRequest(method, rawURL, body)
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}
@@ -157,7 +158,7 @@ func (b *Backend) do(ctx context.Context, method, rawURL, contentType string, bo
 		request.Header.Set("Content-Type", contentType)
 	}
 
-	response, err := b.client.Do(request)
+	response, err := b.client.Do(request.WithContext(ctx))
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}
@@ -247,13 +248,13 @@ func (r *rangeReader) ReadAt(destination []byte, offset int64) (int, error) {
 }
 
 func (r *rangeReader) request(offset int64, length int) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.url, nil)
+	request, err := http.NewRequest(http.MethodGet, r.url, nil)
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}
 	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(length)-1))
 
-	response, err := r.backend.client.Do(request)
+	response, err := r.backend.client.Do(request.WithContext(r.ctx))
 	if err != nil {
 		return nil, vfs.ErrFailure
 	}

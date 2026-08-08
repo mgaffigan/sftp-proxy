@@ -13,11 +13,15 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
 
 	"sftp-proxy/internal/auth"
 	"sftp-proxy/internal/config"
 	"sftp-proxy/internal/httpfs"
+	"sftp-proxy/internal/telemetry"
 	"sftp-proxy/internal/vfs"
 )
 
@@ -35,7 +39,6 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-
 	privateKey, err := os.ReadFile(cfg.HostKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read SSH host key: %w", err)
@@ -66,7 +69,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	var waitGroup sync.WaitGroup
 	for _, listener := range listeners {
 		waitGroup.Go(func() {
-			s.serveListener(listener)
+			s.serveListener(ctx, listener)
 		})
 	}
 
@@ -131,7 +134,7 @@ func (s *Server) listenAll() ([]net.Listener, error) {
 	return listeners, nil
 }
 
-func (s *Server) serveListener(listener net.Listener) {
+func (s *Server) serveListener(ctx context.Context, listener net.Listener) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -141,12 +144,14 @@ func (s *Server) serveListener(listener net.Listener) {
 			s.logger.Error("accept SSH connection", "error", err)
 			continue
 		}
-		go s.serveConnection(connection)
+		go s.serveConnection(ctx, connection)
 	}
 }
 
-func (s *Server) serveConnection(connection net.Conn) {
+func (s *Server) serveConnection(ctx context.Context, connection net.Conn) {
 	defer connection.Close()
+	connectionCtx, span := telemetry.Tracer().Start(ctx, "ssh.connection", trace.WithAttributes(connectionAttributes(connection.RemoteAddr())...))
+	defer span.End()
 	// Bound the handshake: a client that opens a socket and then goes silent
 	// must not hold this goroutine, and the auth callbacks it drives, forever.
 	// This is pre-authentication, so the limit can only come from the server
@@ -159,7 +164,7 @@ func (s *Server) serveConnection(connection net.Conn) {
 		}
 	}
 
-	authConn := s.auth.NewConn()
+	authConn := s.auth.NewConn(connectionCtx)
 	sshConfig := &ssh.ServerConfig{
 		PasswordCallback:  authConn.Password,
 		PublicKeyCallback: authConn.PublicKey,
@@ -168,10 +173,13 @@ func (s *Server) serveConnection(connection net.Conn) {
 
 	sshConnection, channels, requests, err := ssh.NewServerConn(connection, sshConfig)
 	if err != nil {
+		span.SetStatus(codes.Error, "SSH connection rejected")
+		span.SetAttributes(attribute.String("error.type", "ssh_rejected"))
 		s.logger.Info("reject SSH connection", "remote", connection.RemoteAddr(), "error", err)
 		return
 	}
 	defer sshConnection.Close()
+	span.SetAttributes(attribute.String("user.name", sshConnection.User()))
 	// The grace period covers authentication only. Past it liveness is the
 	// authenticated user's ClientAlive policy, which tolerates the long quiet
 	// stretches an SFTP transfer can produce.
@@ -192,7 +200,7 @@ func (s *Server) serveConnection(connection net.Conn) {
 	// the resolution cache, so it must outlive a single channel, and it uses
 	// the connection's cookie jar by way of session.Client.
 	filesystem := s.filesystem(session)
-	requestHandlers := handlers(filesystem, session.User.UploadConcurrencyLimit())
+	requestHandlerFactory := newHandlerFactory(filesystem, session.User.UploadConcurrencyLimit())
 
 	done := make(chan struct{})
 	defer close(done)
@@ -208,7 +216,18 @@ func (s *Server) serveConnection(connection net.Conn) {
 			s.logger.Debug("accept SSH channel", "error", err)
 			continue
 		}
-		go s.serveSession(channel, requests, requestHandlers)
+		go s.serveSession(connectionCtx, session.User.Username, sshConnection.RemoteAddr(), channel, requests, requestHandlerFactory)
+	}
+}
+
+func connectionAttributes(address net.Addr) []attribute.KeyValue {
+	tcpAddress, ok := address.(*net.TCPAddr)
+	if !ok {
+		return nil
+	}
+	return []attribute.KeyValue{
+		attribute.String("client.address", tcpAddress.IP.String()),
+		attribute.Int("client.port", tcpAddress.Port),
 	}
 }
 
@@ -275,7 +294,7 @@ func (s *Server) clientAlive(connection *ssh.ServerConn, user config.User, done 
 	}
 }
 
-func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request, requestHandlers sftp.Handlers) {
+func (s *Server) serveSession(ctx context.Context, username string, remoteAddress net.Addr, channel ssh.Channel, requests <-chan *ssh.Request, requestHandlerFactory *handlerFactory) {
 	defer channel.Close()
 	for request := range requests {
 		if request.Type != "subsystem" {
@@ -292,10 +311,15 @@ func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request,
 			return
 		}
 
-		requestServer := sftp.NewRequestServer(channel, requestHandlers)
+		sessionAttributes := append([]attribute.KeyValue{attribute.String("user.name", username)}, connectionAttributes(remoteAddress)...)
+		sessionCtx, span := telemetry.Tracer().Start(ctx, "sftp.session", trace.WithAttributes(sessionAttributes...))
+		requestServer := sftp.NewRequestServer(channel, requestHandlerFactory.handlers(sessionCtx))
 		if err := requestServer.Serve(); err != nil && !errors.Is(err, io.EOF) {
+			span.SetStatus(codes.Error, "serve SFTP session")
+			span.SetAttributes(attribute.String("error.type", "sftp"))
 			s.logger.Debug("serve SFTP request", "error", err)
 		}
+		span.End()
 		return
 	}
 }

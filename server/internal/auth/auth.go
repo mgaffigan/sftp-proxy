@@ -13,10 +13,14 @@ import (
 	"net/url"
 	"slices"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/ssh"
 
 	"sftp-proxy/internal/config"
+	"sftp-proxy/internal/telemetry"
 )
 
 // errAuthFailed is what every failure becomes on the way out to the SSH layer.
@@ -49,6 +53,7 @@ type Authenticator struct {
 type Conn struct {
 	auth   *Authenticator
 	client *http.Client
+	ctx    context.Context
 
 	// backend is nil when no authBackend is configured, which leaves the static
 	// users in the config file as the only way in.
@@ -63,8 +68,8 @@ type Conn struct {
 // from the config file; Conn resolves those first and only reaches a backend
 // for names the config file does not define.
 type backend interface {
-	Password(connection ssh.ConnMetadata, password []byte) (config.User, error)
-	PublicKey(connection ssh.ConnMetadata, key ssh.PublicKey) (config.User, error)
+	Password(context.Context, ssh.ConnMetadata, []byte) (config.User, error)
+	PublicKey(context.Context, ssh.ConnMetadata, ssh.PublicKey) (config.User, error)
 }
 
 func New(cfg config.Config) *Authenticator {
@@ -73,9 +78,9 @@ func New(cfg config.Config) *Authenticator {
 
 // NewConn starts authentication state for one SSH connection. The caller owns
 // the result and must not share it between connections.
-func (a *Authenticator) NewConn() *Conn {
+func (a *Authenticator) NewConn(ctx context.Context) *Conn {
 	client := newClient()
-	return &Conn{auth: a, client: client, backend: newBackend(a.config.AuthBackend, client)}
+	return &Conn{auth: a, client: client, ctx: ctx, backend: newBackend(a.config.AuthBackend, client)}
 }
 
 // newBackend selects the implementation for the configured backend. Config
@@ -93,37 +98,63 @@ func newBackend(cfg *config.AuthBackend, client *http.Client) backend {
 }
 
 func (c *Conn) Password(connection ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+	ctx, span := telemetry.Tracer().Start(c.ctx, "ssh.auth.password", trace.WithAttributes(authAttributes(connection)...))
+	defer span.End()
 	if user, found := c.auth.config.StaticUser(connection.User()); found {
 		if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), password) != nil {
+			setAuthFailure(span, "credentials")
 			return nil, errAuthFailed
 		}
 		return c.permissions(user), nil
 	}
 	if c.backend == nil {
+		setAuthFailure(span, "unknown_user")
 		return nil, errAuthFailed
 	}
-	user, err := c.backend.Password(connection, password)
+	user, err := c.backend.Password(ctx, connection, password)
 	if err != nil {
+		setAuthFailure(span, "backend")
 		return nil, errAuthFailed
 	}
 	return c.permissions(user), nil
 }
 
 func (c *Conn) PublicKey(connection ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	ctx, span := telemetry.Tracer().Start(c.ctx, "ssh.auth.public_key", trace.WithAttributes(authAttributes(connection)...))
+	defer span.End()
 	if user, found := c.auth.config.StaticUser(connection.User()); found {
 		if !user.HasAuthorizedKey(key) {
+			setAuthFailure(span, "credentials")
 			return nil, errAuthFailed
 		}
 		return c.permissions(user), nil
 	}
 	if c.backend == nil {
+		setAuthFailure(span, "unknown_user")
 		return nil, errAuthFailed
 	}
-	user, err := c.backend.PublicKey(connection, key)
+	user, err := c.backend.PublicKey(ctx, connection, key)
 	if err != nil {
+		setAuthFailure(span, "backend")
 		return nil, errAuthFailed
 	}
 	return c.permissions(user), nil
+}
+
+func authAttributes(connection ssh.ConnMetadata) []attribute.KeyValue {
+	attributes := []attribute.KeyValue{attribute.String("user.name", connection.User())}
+	if address, ok := connection.RemoteAddr().(*net.TCPAddr); ok {
+		attributes = append(attributes,
+			attribute.String("client.address", address.IP.String()),
+			attribute.Int("client.port", address.Port),
+		)
+	}
+	return attributes
+}
+
+func setAuthFailure(span trace.Span, classification string) {
+	span.SetAttributes(attribute.String("auth.failure.classification", classification))
+	span.SetStatus(codes.Error, "authentication failed")
 }
 
 // permissions hands the connection's client to the filesystem layer, so the
@@ -148,9 +179,9 @@ type simpleAuth struct {
 	backendClient
 }
 
-func (a *simpleAuth) Password(connection ssh.ConnMetadata, password []byte) (config.User, error) {
+func (a *simpleAuth) Password(ctx context.Context, connection ssh.ConnMetadata, password []byte) (config.User, error) {
 	var result finalizeResponse
-	err := a.postTo(connection, a.cfg.URL, request{
+	err := a.postTo(ctx, connection, a.cfg.URL, request{
 		Connection: fromConnection(connection),
 		Password:   string(password),
 		Method:     "password",
@@ -165,7 +196,7 @@ func (a *simpleAuth) Password(connection ssh.ConnMetadata, password []byte) (con
 // to publish a user's authorized keys and the server has nothing to check a key
 // against. DESIGN.md: authBackend.url "does not offer public-key
 // authentication."
-func (a *simpleAuth) PublicKey(ssh.ConnMetadata, ssh.PublicKey) (config.User, error) {
+func (a *simpleAuth) PublicKey(context.Context, ssh.ConnMetadata, ssh.PublicKey) (config.User, error) {
 	return config.User{}, errors.New("public-key authentication is not offered in single-endpoint mode")
 }
 
@@ -183,8 +214,8 @@ type fullAuth struct {
 	lookup       *lookupResponse
 }
 
-func (a *fullAuth) Password(connection ssh.ConnMetadata, password []byte) (config.User, error) {
-	lookup, err := a.lookupPolicy(connection)
+func (a *fullAuth) Password(ctx context.Context, connection ssh.ConnMetadata, password []byte) (config.User, error) {
+	lookup, err := a.lookupPolicy(ctx, connection)
 	if err != nil {
 		return config.User{}, err
 	}
@@ -192,14 +223,14 @@ func (a *fullAuth) Password(connection ssh.ConnMetadata, password []byte) (confi
 		return config.User{}, errors.New("password authentication is not allowed for this user")
 	}
 	payload := request{Connection: fromConnection(connection), Password: string(password)}
-	if err := a.post(connection, "password", payload, nil); err != nil {
+	if err := a.post(ctx, connection, "password", payload, nil); err != nil {
 		return config.User{}, err
 	}
-	return a.finalize(connection, "password", "")
+	return a.finalize(ctx, connection, "password", "")
 }
 
-func (a *fullAuth) PublicKey(connection ssh.ConnMetadata, key ssh.PublicKey) (config.User, error) {
-	lookup, err := a.lookupPolicy(connection)
+func (a *fullAuth) PublicKey(ctx context.Context, connection ssh.ConnMetadata, key ssh.PublicKey) (config.User, error) {
+	lookup, err := a.lookupPolicy(ctx, connection)
 	if err != nil {
 		return config.User{}, err
 	}
@@ -209,18 +240,18 @@ func (a *fullAuth) PublicKey(connection ssh.ConnMetadata, key ssh.PublicKey) (co
 	if !matchesKey(lookup.AuthorizedKeys, key) {
 		return config.User{}, errors.New("public key is not authorized for this user")
 	}
-	return a.finalize(connection, "publickey", ssh.FingerprintSHA256(key))
+	return a.finalize(ctx, connection, "publickey", ssh.FingerprintSHA256(key))
 }
 
 // lookupPolicy returns the backend's policy for the user this connection is
 // currently authenticating as, fetching it on first use.
-func (a *fullAuth) lookupPolicy(connection ssh.ConnMetadata) (*lookupResponse, error) {
+func (a *fullAuth) lookupPolicy(ctx context.Context, connection ssh.ConnMetadata) (*lookupResponse, error) {
 	if a.lookup != nil && a.lookedUpUser == connection.User() {
 		return a.lookup, nil
 	}
 
 	var lookup lookupResponse
-	if err := a.post(connection, "lookup", request{Connection: fromConnection(connection)}, &lookup); err != nil {
+	if err := a.post(ctx, connection, "lookup", request{Connection: fromConnection(connection)}, &lookup); err != nil {
 		return nil, err
 	}
 	if len(lookup.Methods) == 0 {
@@ -230,9 +261,9 @@ func (a *fullAuth) lookupPolicy(connection ssh.ConnMetadata) (*lookupResponse, e
 	return a.lookup, nil
 }
 
-func (a *fullAuth) finalize(connection ssh.ConnMetadata, method, fingerprint string) (config.User, error) {
+func (a *fullAuth) finalize(ctx context.Context, connection ssh.ConnMetadata, method, fingerprint string) (config.User, error) {
 	var result finalizeResponse
-	err := a.post(connection, "finalize", request{
+	err := a.post(ctx, connection, "finalize", request{
 		Connection:  fromConnection(connection),
 		Method:      method,
 		Fingerprint: fingerprint,
@@ -244,12 +275,12 @@ func (a *fullAuth) finalize(connection ssh.ConnMetadata, method, fingerprint str
 }
 
 // post sends to one of the baseURL-relative endpoints.
-func (a *fullAuth) post(connection ssh.ConnMetadata, endpoint string, payload request, target any) error {
+func (a *fullAuth) post(ctx context.Context, connection ssh.ConnMetadata, endpoint string, payload request, target any) error {
 	rawURL, err := endpointURL(a.cfg.BaseURL, endpoint)
 	if err != nil {
 		return err
 	}
-	return a.postTo(connection, rawURL, payload, target)
+	return a.postTo(ctx, connection, rawURL, payload, target)
 }
 
 // backendClient is the HTTP plumbing both backends share: one POST of a request
@@ -259,7 +290,7 @@ type backendClient struct {
 	http *http.Client
 }
 
-func (b *backendClient) postTo(connection ssh.ConnMetadata, rawURL string, payload request, target any) error {
+func (b *backendClient) postTo(ctx context.Context, connection ssh.ConnMetadata, rawURL string, payload request, target any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -268,13 +299,13 @@ func (b *backendClient) postTo(connection ssh.ConnMetadata, rawURL string, paylo
 	// response, and decode — runs under one bounded context. The bound is
 	// per-request rather than an http.Client.Timeout because this same client is
 	// handed to the filesystem afterwards, where transfers may run much longer.
-	ctx := context.Background()
+	requestCtx := ctx
 	if timeout := b.cfg.RequestTimeout(); timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
+		requestCtx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, rawURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -357,7 +388,7 @@ func newClient() *http.Client {
 	if err != nil {
 		panic(err)
 	}
-	return &http.Client{Jar: jar}
+	return telemetry.NewHTTPClient(&http.Client{Jar: jar})
 }
 
 func fromConnection(connection ssh.ConnMetadata) metadata {

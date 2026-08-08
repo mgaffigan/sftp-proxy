@@ -4,12 +4,17 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"golang.org/x/crypto/ssh"
 
 	"sftp-proxy/internal/config"
@@ -45,7 +50,7 @@ func TestPasswordAuthenticationFinalizesBackendSession(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn()
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn(t.Context())
 	permissions, err := authConn.Password(testConnection{username: "acme"}, []byte("not logged"))
 	if err != nil {
 		t.Fatalf("Password() error = %v", err)
@@ -84,7 +89,7 @@ func TestPasswordAuthenticationWithSingleEndpoint(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL + "/auth"}}).NewConn()
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL + "/auth"}}).NewConn(t.Context())
 	permissions, err := authConn.Password(testConnection{username: "acme"}, []byte("secret"))
 	if err != nil {
 		t.Fatalf("Password() error = %v", err)
@@ -112,7 +117,7 @@ func TestAuthenticationFollowsCrossOriginRedirects(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL}}).NewConn()
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL}}).NewConn(t.Context())
 	permissions, err := authConn.Password(testConnection{username: "acme"}, []byte("secret"))
 	if err != nil {
 		t.Fatalf("Password() through a cross-origin redirect = %v", err)
@@ -140,7 +145,7 @@ func TestPublicKeyIsRejectedWithSingleEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL + "/auth"}}).NewConn()
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL + "/auth"}}).NewConn(t.Context())
 	if _, ok := authConn.backend.(*simpleAuth); !ok {
 		t.Fatalf("backend = %T, want *simpleAuth", authConn.backend)
 	}
@@ -192,19 +197,90 @@ func TestLookupIsNotReusedAcrossUsernames(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn()
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{BaseURL: backend.URL}}).NewConn(t.Context())
 	fullBackend, ok := authConn.backend.(*fullAuth)
 	if !ok {
 		t.Fatalf("backend = %T, want *fullAuth", authConn.backend)
 	}
 	for _, username := range []string{"acme", "acme", "other", "other"} {
-		if _, err := fullBackend.lookupPolicy(testConnection{username: username}); err != nil {
+		if _, err := fullBackend.lookupPolicy(t.Context(), testConnection{username: username}); err != nil {
 			t.Fatalf("lookupPolicy(%q) error = %v", username, err)
 		}
 	}
 	if want := []string{"acme", "other"}; !slices.Equal(lookedUp, want) {
 		t.Fatalf("lookups = %v, want %v", lookedUp, want)
 	}
+}
+
+func TestBackendAuthenticationFailureIsTracedWithoutCredentials(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := trace.NewTracerProvider(trace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { _ = provider.Shutdown(t.Context()) })
+	previousProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() { otel.SetTracerProvider(previousProvider) })
+	tracer := provider.Tracer("test")
+
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Error(writer, "backend details must not reach traces", http.StatusInternalServerError)
+	}))
+	defer backend.Close()
+
+	connectionCtx, connectionSpan := tracer.Start(t.Context(), "ssh.connection")
+	authConn := New(config.Config{AuthBackend: &config.AuthBackend{URL: backend.URL}}).NewConn(connectionCtx)
+	if _, err := authConn.Password(testConnection{username: "acme"}, []byte("secret")); !errors.Is(err, errAuthFailed) {
+		t.Fatalf("Password() error = %v, want errAuthFailed", err)
+	}
+	connectionSpan.End()
+
+	spans := recorder.Ended()
+	authentication := authSpanNamed(spans, "ssh.auth.password")
+	request := authSpanNamed(spans, "HTTP POST")
+	if authentication == nil || request == nil {
+		t.Fatalf("ended spans = %v, want authentication and HTTP request", authSpanNames(spans))
+	}
+	if authentication.Parent().SpanID() != connectionSpan.SpanContext().SpanID() || request.Parent().SpanID() != authentication.SpanContext().SpanID() {
+		t.Fatalf("unexpected span parentage: authentication=%s request=%s", authentication.Parent().SpanID(), request.Parent().SpanID())
+	}
+	if authentication.Status().Code != codes.Error || request.Status().Code != codes.Error {
+		t.Fatalf("span status = authentication=%v request=%v, want error", authentication.Status(), request.Status())
+	}
+	if got := authSpanAttribute(request, "http.response.status_code"); got != "500" {
+		t.Fatalf("backend HTTP status = %q, want 500", got)
+	}
+	for _, span := range []trace.ReadOnlySpan{authentication, request} {
+		for _, value := range span.Attributes() {
+			if string(value.Key) == "password" || value.Value.AsString() == "secret" || value.Value.AsString() == "backend details must not reach traces" {
+				t.Fatalf("span %q exposes sensitive value %s=%q", span.Name(), value.Key, value.Value.AsString())
+			}
+		}
+	}
+}
+
+func authSpanNamed(spans []trace.ReadOnlySpan, name string) trace.ReadOnlySpan {
+	for _, span := range spans {
+		if span.Name() == name {
+			return span
+		}
+	}
+	return nil
+}
+
+func authSpanNames(spans []trace.ReadOnlySpan) []string {
+	names := make([]string, 0, len(spans))
+	for _, span := range spans {
+		names = append(names, span.Name())
+	}
+	return names
+}
+
+func authSpanAttribute(span trace.ReadOnlySpan, key string) string {
+	for _, value := range span.Attributes() {
+		if string(value.Key) == key {
+			return value.Value.Emit()
+		}
+	}
+	return ""
 }
 
 type testConnection struct{ username string }

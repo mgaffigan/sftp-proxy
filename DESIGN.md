@@ -71,8 +71,8 @@ listing has content type `application/vnd.sftpproxy.directory+json` and the
 documented `children` shape. Static configuration entries and entries returned
 by a dynamic backend are homomorphic: both use the `entry` shape from the
 configuration schema. A backend may therefore return `children`,
-`allowedMethods`, `size`, `maxUploadSize`, and `maxConcurrentUploads` on an
-entry, using the same field names and shape as static configuration.
+`allowedMethods`, `size`, and `maxUploadSize` on an entry, using the same field
+names and shape as static configuration.
 
 A successful file response is streamed to the client; `Content-Length`,
 `Last-Modified`, and `ETag` provide synthetic SFTP metadata when present. Byte
@@ -106,11 +106,15 @@ the modes an SFTP client is shown describe only whether a node is a directory.
 
 Files are uploaded by staging their SFTP writes in a private local directory.
 On a successful close, the proxy sends the completed content as `POST` with
-content type `application/octet-stream`. Aborted handles are discarded. Upload
-size and simultaneous-upload limits are optional configuration values per
-directory and per connection; when a count limit is reached, opening a new
-upload is rejected. Disk and memory resource limits otherwise remain an
-operational responsibility of the OS or container runtime.
+content type `application/octet-stream`. Aborted handles are discarded.
+`maxUploadSize` is optional on a file or directory entry. On a file it rejects
+writes beyond that file's limit; a backend creating a direct child of a
+directory copies the directory's limit to that new file. The value is not
+otherwise inherited. `maxConcurrentUploads` is an optional user configuration
+value that limits uploads open at once on each of that user's SFTP connections;
+when the count limit is reached, opening a new upload is rejected. Disk and
+memory resource limits otherwise remain an operational responsibility of the
+OS or container runtime.
 
 An empty `POST` with content type
 `application/vnd.sftpproxy.directoryentry` creates a directory. Plain `DELETE`

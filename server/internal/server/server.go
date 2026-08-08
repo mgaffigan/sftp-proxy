@@ -192,6 +192,7 @@ func (s *Server) serveConnection(connection net.Conn) {
 	// the resolution cache, so it must outlive a single channel, and it uses
 	// the connection's cookie jar by way of session.Client.
 	filesystem := s.filesystem(session)
+	requestHandlers := handlers(filesystem, session.User.UploadConcurrencyLimit())
 
 	done := make(chan struct{})
 	defer close(done)
@@ -207,7 +208,7 @@ func (s *Server) serveConnection(connection net.Conn) {
 			s.logger.Debug("accept SSH channel", "error", err)
 			continue
 		}
-		go s.serveSession(channel, requests, filesystem)
+		go s.serveSession(channel, requests, requestHandlers)
 	}
 }
 
@@ -274,7 +275,7 @@ func (s *Server) clientAlive(connection *ssh.ServerConn, user config.User, done 
 	}
 }
 
-func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request, filesystem *vfs.FS) {
+func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request, requestHandlers sftp.Handlers) {
 	defer channel.Close()
 	for request := range requests {
 		if request.Type != "subsystem" {
@@ -291,7 +292,7 @@ func (s *Server) serveSession(channel ssh.Channel, requests <-chan *ssh.Request,
 			return
 		}
 
-		requestServer := sftp.NewRequestServer(channel, handlers(filesystem))
+		requestServer := sftp.NewRequestServer(channel, requestHandlers)
 		if err := requestServer.Serve(); err != nil && !errors.Is(err, io.EOF) {
 			s.logger.Debug("serve SFTP request", "error", err)
 		}

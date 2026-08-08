@@ -27,6 +27,18 @@ type FS struct {
 	resolved map[string]Node
 }
 
+type sizeLimitedWriter struct {
+	WriterAtCloser
+	maxSize int64
+}
+
+func (w sizeLimitedWriter) WriteAt(data []byte, offset int64) (int, error) {
+	if offset < 0 || offset > w.maxSize || int64(len(data)) > w.maxSize-offset {
+		return 0, ErrFailure
+	}
+	return w.WriterAtCloser.WriteAt(data, offset)
+}
+
 func New(root config.RootFS, backends Backends) *FS {
 	return &FS{root: root, backends: backends, resolved: make(map[string]Node)}
 }
@@ -121,7 +133,14 @@ func (f *FS) Create(ctx context.Context, path string) (WriterAtCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	return backend.Create(ctx, node)
+	writer, err := backend.Create(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+	if node.MaxUploadSize > 0 {
+		return sizeLimitedWriter{WriterAtCloser: writer, maxSize: node.MaxUploadSize}, nil
+	}
+	return writer, nil
 }
 
 func (f *FS) Mkdir(ctx context.Context, path string) error {

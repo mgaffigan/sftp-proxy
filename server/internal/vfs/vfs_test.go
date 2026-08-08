@@ -17,6 +17,7 @@ type mock struct {
 	scheme   string
 	children map[string][]Node
 	fail     error
+	writer   WriterAtCloser
 
 	mu    sync.Mutex
 	calls []string
@@ -95,7 +96,10 @@ func (m *mock) Open(ctx context.Context, node Node) (ReaderAtCloser, error) {
 
 func (m *mock) Create(ctx context.Context, node Node) (WriterAtCloser, error) {
 	m.record("Create %s", node.Backend)
-	return nil, m.fail
+	if m.fail != nil {
+		return nil, m.fail
+	}
+	return m.writer, nil
 }
 
 func (m *mock) Mkdir(ctx context.Context, node Node) error {
@@ -115,7 +119,7 @@ func (m *mock) Rename(ctx context.Context, node Node, target string) error {
 
 func (m *mock) Child(node Node, name string) (Node, error) {
 	m.record("Child %s %s", node.Backend, name)
-	return Node{File: name, Backend: node.Backend + "/" + name}, nil
+	return Node{File: name, Backend: node.Backend + "/" + name, MaxUploadSize: node.MaxUploadSize}, nil
 }
 
 // tree is the fixture used throughout: /a/b/c.txt, all served by one backend.
@@ -379,6 +383,74 @@ func TestCreateAndMkdirRefuseAnExistingDirectory(t *testing.T) {
 	}
 	if err := filesystem.Mkdir(ctx, "/a/b"); !errors.Is(err, ErrExist) {
 		t.Fatalf("Mkdir() over a directory = %v, want exists", err)
+	}
+}
+
+type recordingWriter struct {
+	writes int
+}
+
+func (writer *recordingWriter) WriteAt(data []byte, offset int64) (int, error) {
+	writer.writes++
+	return len(data), nil
+}
+
+func (writer *recordingWriter) Close() error { return nil }
+
+func TestCreateEnforcesTheExactNodeUploadSize(t *testing.T) {
+	backend := newMock("mock")
+	writer := &recordingWriter{}
+	backend.writer = writer
+	filesystem := New(config.RootFS{Children: []config.Entry{
+		{File: "limited.txt", Backend: "mock://files/limited.txt", MaxUploadSize: 3},
+		{File: "unlimited.txt", Backend: "mock://files/unlimited.txt"},
+	}}, Backends{"mock": backend})
+
+	limited, err := filesystem.Create(context.Background(), "/limited.txt")
+	if err != nil {
+		t.Fatalf("Create(limited) error = %v", err)
+	}
+	if count, err := limited.WriteAt([]byte("abc"), 0); err != nil || count != 3 {
+		t.Fatalf("limited WriteAt within limit = (%d, %v), want (3, nil)", count, err)
+	}
+	if count, err := limited.WriteAt([]byte("d"), 3); count != 0 || !errors.Is(err, ErrFailure) {
+		t.Fatalf("limited WriteAt beyond limit = (%d, %v), want (0, failure)", count, err)
+	}
+	if writer.writes != 1 {
+		t.Fatalf("backend writes after rejected upload = %d, want 1", writer.writes)
+	}
+
+	unlimited, err := filesystem.Create(context.Background(), "/unlimited.txt")
+	if err != nil {
+		t.Fatalf("Create(unlimited) error = %v", err)
+	}
+	if count, err := unlimited.WriteAt([]byte("abcd"), 0); err != nil || count != 4 {
+		t.Fatalf("unlimited WriteAt = (%d, %v), want (4, nil)", count, err)
+	}
+}
+
+func TestCreateEnforcesContainingDirectoryUploadSizeForNewFiles(t *testing.T) {
+	backend := newMock("mock")
+	writer := &recordingWriter{}
+	backend.writer = writer
+	filesystem := New(config.RootFS{Children: []config.Entry{{
+		Directory:     "inbound",
+		Backend:       "mock://files/inbound",
+		MaxUploadSize: 3,
+	}}}, Backends{"mock": backend})
+
+	created, err := filesystem.Create(context.Background(), "/inbound/new.txt")
+	if err != nil {
+		t.Fatalf("Create(new) error = %v", err)
+	}
+	if count, err := created.WriteAt([]byte("abc"), 0); err != nil || count != 3 {
+		t.Fatalf("new WriteAt within limit = (%d, %v), want (3, nil)", count, err)
+	}
+	if count, err := created.WriteAt([]byte("d"), 3); count != 0 || !errors.Is(err, ErrFailure) {
+		t.Fatalf("new WriteAt beyond limit = (%d, %v), want (0, failure)", count, err)
+	}
+	if writer.writes != 1 {
+		t.Fatalf("backend writes after rejected new-file upload = %d, want 1", writer.writes)
 	}
 }
 

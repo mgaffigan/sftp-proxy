@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -91,5 +92,61 @@ func TestUnsupportedRequestMethodsAreRefused(t *testing.T) {
 	}
 	if _, err := adapter.Filelist(sftp.NewRequest("Readlink", "/a")); !errors.Is(err, sftp.ErrSSHFxOpUnsupported) {
 		t.Errorf("Filelist(Readlink) = %v, want op unsupported", err)
+	}
+}
+
+type testWriter struct{}
+
+func (testWriter) WriteAt(data []byte, offset int64) (int, error) { return len(data), nil }
+func (testWriter) Close() error                                   { return nil }
+
+type testWriteBackend struct{}
+
+func (testWriteBackend) List(context.Context, vfs.Node) ([]vfs.Node, error) {
+	return nil, vfs.ErrUnsupported
+}
+
+func (testWriteBackend) Open(context.Context, vfs.Node) (vfs.ReaderAtCloser, error) {
+	return nil, vfs.ErrUnsupported
+}
+
+func (testWriteBackend) Create(context.Context, vfs.Node) (vfs.WriterAtCloser, error) {
+	return testWriter{}, nil
+}
+
+func (testWriteBackend) Mkdir(context.Context, vfs.Node) error  { return vfs.ErrUnsupported }
+func (testWriteBackend) Remove(context.Context, vfs.Node) error { return vfs.ErrUnsupported }
+
+func (testWriteBackend) Rename(context.Context, vfs.Node, string) error {
+	return vfs.ErrUnsupported
+}
+
+func (testWriteBackend) Child(vfs.Node, string) (vfs.Node, error) {
+	return vfs.Node{}, vfs.ErrUnsupported
+}
+
+func TestFilewriteLimitsConcurrentUploads(t *testing.T) {
+	filesystem := vfs.New(config.RootFS{Children: []config.Entry{
+		{File: "first.txt", Backend: "test://files/first.txt"},
+		{File: "second.txt", Backend: "test://files/second.txt"},
+	}}, vfs.Backends{"test": testWriteBackend{}})
+	adapter := handlers(filesystem, 1).FilePut.(*sftpFS)
+
+	first, err := adapter.Filewrite(sftp.NewRequest("Put", "/first.txt"))
+	if err != nil {
+		t.Fatalf("first Filewrite() error = %v", err)
+	}
+	if _, err := adapter.Filewrite(sftp.NewRequest("Put", "/second.txt")); !errors.Is(err, sftp.ErrSSHFxFailure) {
+		t.Fatalf("second Filewrite() error = %v, want failure", err)
+	}
+	closer, ok := first.(io.Closer)
+	if !ok {
+		t.Fatalf("first writer %T does not close", first)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if _, err := adapter.Filewrite(sftp.NewRequest("Put", "/second.txt")); err != nil {
+		t.Fatalf("second Filewrite() after Close error = %v", err)
 	}
 }

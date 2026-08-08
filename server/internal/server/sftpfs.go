@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -15,11 +16,27 @@ import (
 // place that knows about the SFTP protocol; everything below it deals in paths
 // and nodes.
 type sftpFS struct {
-	fs *vfs.FS
+	fs      *vfs.FS
+	uploads chan struct{}
 }
 
-func handlers(filesystem *vfs.FS) sftp.Handlers {
+type uploadWriter struct {
+	vfs.WriterAtCloser
+	release func()
+	once    sync.Once
+}
+
+func (w *uploadWriter) Close() error {
+	err := w.WriterAtCloser.Close()
+	w.once.Do(w.release)
+	return err
+}
+
+func handlers(filesystem *vfs.FS, maxConcurrentUploads int) sftp.Handlers {
 	adapter := &sftpFS{fs: filesystem}
+	if maxConcurrentUploads > 0 {
+		adapter.uploads = make(chan struct{}, maxConcurrentUploads)
+	}
 	return sftp.Handlers{FileGet: adapter, FilePut: adapter, FileCmd: adapter, FileList: adapter}
 }
 
@@ -32,11 +49,25 @@ func (s *sftpFS) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (s *sftpFS) Filewrite(request *sftp.Request) (io.WriterAt, error) {
+	if s.uploads == nil {
+		writer, err := s.fs.Create(request.Context(), request.Filepath)
+		if err != nil {
+			return nil, statusError(err)
+		}
+		return writer, nil
+	}
+
+	select {
+	case s.uploads <- struct{}{}:
+	default:
+		return nil, statusError(vfs.ErrFailure)
+	}
 	writer, err := s.fs.Create(request.Context(), request.Filepath)
 	if err != nil {
+		<-s.uploads
 		return nil, statusError(err)
 	}
-	return writer, nil
+	return &uploadWriter{WriterAtCloser: writer, release: func() { <-s.uploads }}, nil
 }
 
 func (s *sftpFS) Filecmd(request *sftp.Request) error {

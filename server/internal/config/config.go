@@ -51,12 +51,13 @@ type AuthBackend struct {
 }
 
 type User struct {
-	Username            string   `json:"username"`
-	PasswordHash        string   `json:"passwordHash,omitempty"`
-	AuthorizedKeys      []string `json:"authorizedKeys,omitempty"`
-	ClientAliveMs       Millis   `json:"clientAliveMs,omitempty"`
-	ClientAliveCountMax *int     `json:"clientAliveCountMax,omitempty"`
-	RootFS              RootFS   `json:"rootfs"`
+	Username             string   `json:"username"`
+	PasswordHash         string   `json:"passwordHash,omitempty"`
+	AuthorizedKeys       []string `json:"authorizedKeys,omitempty"`
+	ClientAliveMs        Millis   `json:"clientAliveMs,omitempty"`
+	ClientAliveCountMax  *int     `json:"clientAliveCountMax,omitempty"`
+	MaxConcurrentUploads int      `json:"maxConcurrentUploads,omitempty"`
+	RootFS               RootFS   `json:"rootfs"`
 }
 
 // LoginGrace reports how long a connection may take to authenticate, after
@@ -95,10 +96,15 @@ func (u User) ClientAlive() (interval time.Duration, countMax int) {
 	return max(u.ClientAliveMs.Duration(), 0), countMax
 }
 
+func (u User) UploadConcurrencyLimit() int {
+	return max(u.MaxConcurrentUploads, 0)
+}
+
 type RootFS struct {
 	Backend        string   `json:"backend,omitempty"`
 	AllowedMethods []string `json:"allowedMethods,omitempty"`
 	Children       []Entry  `json:"children,omitempty"`
+	MaxUploadSize  int64    `json:"maxUploadSize,omitempty"`
 }
 
 // Entry views the root as the directory node it is, so that resolution,
@@ -109,18 +115,18 @@ func (r RootFS) Entry() Entry {
 		Backend:        r.Backend,
 		AllowedMethods: r.AllowedMethods,
 		Children:       r.Children,
+		MaxUploadSize:  r.MaxUploadSize,
 	}
 }
 
 type Entry struct {
-	Directory            string   `json:"directory,omitempty"`
-	File                 string   `json:"file,omitempty"`
-	Backend              string   `json:"backend,omitempty"`
-	AllowedMethods       []string `json:"allowedMethods,omitempty"`
-	Size                 int64    `json:"size,omitempty"`
-	Children             []Entry  `json:"children,omitempty"`
-	MaxUploadSize        int64    `json:"maxUploadSize,omitempty"`
-	MaxConcurrentUploads int      `json:"maxConcurrentUploads,omitempty"`
+	Directory      string   `json:"directory,omitempty"`
+	File           string   `json:"file,omitempty"`
+	Backend        string   `json:"backend,omitempty"`
+	AllowedMethods []string `json:"allowedMethods,omitempty"`
+	Size           int64    `json:"size,omitempty"`
+	Children       []Entry  `json:"children,omitempty"`
+	MaxUploadSize  int64    `json:"maxUploadSize,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -225,10 +231,16 @@ func (u User) Validate() error {
 	if u.ClientAliveCountMax != nil && *u.ClientAliveCountMax < 0 {
 		return errors.New("clientAliveCountMax cannot be negative")
 	}
+	if u.MaxConcurrentUploads < 0 {
+		return errors.New("maxConcurrentUploads cannot be negative")
+	}
 	return u.RootFS.Validate()
 }
 
 func (r RootFS) Validate() error {
+	if r.MaxUploadSize < 0 {
+		return errors.New("upload limit cannot be negative")
+	}
 	if r.Backend != "" {
 		if err := validateBackendURL(r.Backend); err != nil {
 			return err
@@ -268,8 +280,8 @@ func (e Entry) Validate() error {
 	if !validName(e.Name()) {
 		return fmt.Errorf("invalid entry name %q", e.Name())
 	}
-	if e.Size < 0 || e.MaxUploadSize < 0 || e.MaxConcurrentUploads < 0 {
-		return errors.New("file size and upload limits cannot be negative")
+	if e.Size < 0 || e.MaxUploadSize < 0 {
+		return errors.New("file size and upload limit cannot be negative")
 	}
 	if e.File != "" {
 		if e.Backend == "" {

@@ -122,17 +122,21 @@ func (b *Backend) Rename(ctx context.Context, node vfs.Node, target string) erro
 
 // Child names a member of a directory by appending one path segment to it.
 //
-// The child carries the directory's allowedMethods because a node that does
-// not exist yet has none of its own, and creating within a directory is
-// governed by that directory's POST. Nothing else is inherited: once the node
-// exists, a listing states its methods and only those apply.
+// The child carries the directory's allowedMethods and maxUploadSize because a
+// node that does not exist yet has none of its own. Once the node exists, a
+// listing states its properties and only those apply.
 func (b *Backend) Child(node vfs.Node, name string) (vfs.Node, error) {
 	parsed, err := url.Parse(node.Backend)
 	if err != nil {
 		return vfs.Node{}, vfs.ErrFailure
 	}
 	parsed.Path = strings.TrimSuffix(parsed.Path, "/") + "/" + name
-	return vfs.Node{File: name, Backend: parsed.String(), AllowedMethods: node.AllowedMethods}, nil
+	return vfs.Node{
+		File:           name,
+		Backend:        parsed.String(),
+		AllowedMethods: node.AllowedMethods,
+		MaxUploadSize:  node.MaxUploadSize,
+	}, nil
 }
 
 func (b *Backend) mutate(ctx context.Context, method, rawURL, contentType string, body io.Reader) error {

@@ -212,12 +212,13 @@ func TestRemoveAndRenameBothDelete(t *testing.T) {
 	}
 }
 
-func TestChildAppendsOneSegmentAndCarriesTheDirectorysMethods(t *testing.T) {
+func TestChildAppendsOneSegmentAndCarriesCreationPolicy(t *testing.T) {
 	backend := New(http.DefaultClient, t.TempDir())
 	parent := vfs.Node{
 		Directory:      "d",
 		Backend:        "https://files.test/base/d/",
 		AllowedMethods: []string{http.MethodPost},
+		MaxUploadSize:  42,
 	}
 
 	child, err := backend.Child(parent, "new file.txt")
@@ -234,6 +235,9 @@ func TestChildAppendsOneSegmentAndCarriesTheDirectorysMethods(t *testing.T) {
 	// is governed by the directory that will hold it.
 	if len(child.AllowedMethods) != 1 || child.AllowedMethods[0] != http.MethodPost {
 		t.Fatalf("child methods = %v", child.AllowedMethods)
+	}
+	if child.MaxUploadSize != 42 {
+		t.Fatalf("child max upload size = %d, want 42", child.MaxUploadSize)
 	}
 }
 

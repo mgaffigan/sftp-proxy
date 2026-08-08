@@ -50,7 +50,8 @@ type Backend interface {
 	// backend decides whether it can, including when target lies outside it.
 	Rename(ctx context.Context, node Node, target string) error
 	// Child names a member of a directory node, whether or not it exists yet,
-	// so that a create has somewhere to write to.
+	// so that a create has somewhere to write to. It copies any directory
+	// policy that governs creation into the returned node.
 	Child(node Node, name string) (Node, error)
 }
 

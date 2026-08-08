@@ -33,6 +33,10 @@ func TestConfigValidateAcceptsStaticHTTPUser(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
+	cfg.Users[0].MaxConcurrentUploads = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted a negative maxConcurrentUploads")
+	}
 }
 
 func TestRootFSValidatesItsOwnBackendAndMethods(t *testing.T) {
@@ -73,6 +77,13 @@ func TestConfigValidateRejectsInvalidAllowedMethod(t *testing.T) {
 	entry := Entry{Directory: "Inbound", Backend: "https://files.example.test/inbound", AllowedMethods: []string{"PUT"}}
 	if err := entry.Validate(); err == nil {
 		t.Fatal("Validate() succeeded with an unsupported allowed method")
+	}
+}
+
+func TestConfigValidateAcceptsDirectoryUploadSizeLimit(t *testing.T) {
+	entry := Entry{Directory: "Inbound", Backend: "https://files.example.test/inbound", MaxUploadSize: 1}
+	if err := entry.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
 

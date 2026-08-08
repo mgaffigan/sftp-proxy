@@ -1,8 +1,9 @@
-We're going to create a bulletproof SFTP to HTTP proxy that can serve as a front-end for a B2B interface.  We want to use the most widely deployed and tested SFTP/SCP library that we can, while avoiding unneccessary complexity (wireguard-style auditable code is best, but new entrants that are not established are not ok).  Go, C#, rust, java, and other languages if approved are fine .  C/C++ should be avoided.
+# SFTP to HTTP Proxy Design
+A bulletproof SFTP to HTTP proxy that can serve as a front-end for a B2B interface.  We want to use the most widely deployed and tested libraries that we can, while avoiding unneccessary complexity (wireguard-style auditable code is best).
 
 ## V1 Implementation Contract
 
-The first implementation is Go, using `golang.org/x/crypto/ssh` for SSH and
+The server is implemented in Go, using `golang.org/x/crypto/ssh` for SSH and
 `github.com/pkg/sftp` for SFTP. It supports SFTP and SCP over the same virtual
 filesystem, served by an HTTP backend, a local filesystem backend, and an
 S3-compatible object store backend.

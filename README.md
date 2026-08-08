@@ -38,6 +38,8 @@ default `sftpproxy` user.
 
 - [Static configuration](docs/static-configuration.md): configure one or more
 	users directly and forward a drop-only `Inbound` directory to an upload URL.
+- [Authentication backend](docs/auth-backend.md): authenticate users and
+	provide their filesystem over HTTP.
 - [Local files](docs/local-files.md): serve directories that already exist on
 	the host, with no HTTP backend involved.
 - [S3 buckets](docs/s3-backend.md): serve objects from AWS S3 or an

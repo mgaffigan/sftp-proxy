@@ -13,7 +13,8 @@ services:
       context: ..
     profiles: [trivial]
     depends_on:
-      - backend-trivial
+      backend-trivial:
+        condition: service_started
     volumes:
       - ./configs/trivial.json:/config/config.json:ro
     user: "0:0"
@@ -31,6 +32,57 @@ services:
       - ./clients:/tests:ro
       - ./fixtures:/fixtures:ro
     command: ["/bin/sh", "/tests/trivial.sh"]
+
+  setup-pubkey-keys:
+    build:
+      context: ..
+    profiles: [pubkey]
+    user: "0:0"
+    volumes:
+      - pubkey-client-key:/keys
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["rm -f /keys/acme /keys/acme.pub && ssh-keygen -q -t ed25519 -N '' -f /keys/acme"]
+
+  backend-pubkey:
+    build:
+      context: .
+      dockerfile: backend/trivial.Dockerfile
+    profiles: [pubkey]
+    depends_on:
+      setup-pubkey-keys:
+        condition: service_completed_successfully
+    volumes:
+      - ./backend/pubkey.js:/app/server.js:ro
+      - pubkey-client-key:/keys:ro
+    command: ["node", "/app/server.js"]
+
+  proxy-pubkey:
+    build:
+      context: ..
+    profiles: [pubkey]
+    depends_on:
+      backend-pubkey:
+        condition: service_started
+      setup-pubkey-keys:
+        condition: service_completed_successfully
+    volumes:
+      - ./configs/pubkey.json:/config/config.json:ro
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["ssh-keygen -q -t ed25519 -N '' -f /run/host_key && exec /usr/local/bin/sftp-proxy -config /config/config.json"]
+
+  clients-pubkey:
+    build:
+      context: .
+      dockerfile: clients.Dockerfile
+    profiles: [pubkey]
+    depends_on:
+      - proxy-pubkey
+    volumes:
+      - ./clients:/tests:ro
+      - ./fixtures:/fixtures:ro
+      - pubkey-client-key:/keys:ro
+    command: ["/bin/sh", "/tests/pubkey.sh"]
 
   backend-full:
     image: node:22-alpine
@@ -132,3 +184,4 @@ services:
 
 volumes:
   full-hostkey:
+  pubkey-client-key:
